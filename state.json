@@ -238,5 +238,11 @@
     "current": 999.0,
     "average": 2799.0,
     "sent_at": 1791313088
+  },
+  "Myntra|https://www.myntra.com/shirts/rare+rabbit/rare-rabbit-men-neutron-8-slim-fit-cotton-shirt/27271254/buy": {
+    "title": "RARE RABBIT Men Neutron-8 Slim Fit Cotton Shirt",
+    "current": 1583.0,
+    "average": 3204.0,
+    "sent_at": 1791313616
   }
 }
