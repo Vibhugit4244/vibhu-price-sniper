@@ -16,18 +16,25 @@ from bs4 import BeautifulSoup
 MAX_PRICE = 5000.0
 DROP_RATIO = 0.50
 
-# TARGET: at least 1,000 product pages per run
+# Number of product pages we actually want to CHECK.
 TARGET_PRODUCTS = 1000
 
-# Discover more than we need so failed/duplicate pages
-# do not reduce the final scan below the target.
-DISCOVERY_TARGET = 3000
+# Discover more than required so duplicates/failures don't
+# reduce the final number too much.
+DISCOVERY_TARGET = 5000
 
-REQUEST_DELAY = 0.20
-TIMEOUT = 20
+REQUEST_DELAY = 0.15
+TIMEOUT = 15
+
+# Maximum listing pages to discover from each starting page.
+MAX_PAGES_PER_SOURCE = 100
 
 STATE_FILE = Path("state.json")
 
+
+# ============================================================
+# HEADERS
+# ============================================================
 
 HEADERS = {
     "User-Agent": (
@@ -45,10 +52,13 @@ HEADERS = {
 
 
 # ============================================================
-# SOURCES
+# SOURCE PAGES
 # ============================================================
 
 SOURCE_PAGES = [
+    # -------------------------
+    # PriceHistoryApp
+    # -------------------------
     (
         "PriceHistoryApp",
         "https://pricehistoryapp.com/deals",
@@ -65,6 +75,10 @@ SOURCE_PAGES = [
         "PriceHistoryApp",
         "https://pricehistoryapp.com/deals/store/myntra",
     ),
+
+    # -------------------------
+    # PriceDropy
+    # -------------------------
     (
         "PriceDropy",
         "https://pricedropy.com/",
@@ -77,6 +91,10 @@ SOURCE_PAGES = [
         "PriceDropy",
         "https://pricedropy.com/myntra-price-history",
     ),
+
+    # -------------------------
+    # PriceTrail
+    # -------------------------
     (
         "PriceTrail",
         "https://pricehistorytracker.in/",
@@ -88,12 +106,84 @@ SOURCE_PAGES = [
 ]
 
 
-# Pages to try.
-# Not every source necessarily has every page.
+# ============================================================
+# OPTIONAL CATEGORY PAGES
+#
+# These provide additional discovery routes.
+# ============================================================
+
+EXTRA_SOURCE_PAGES = [
+    # PriceHistoryApp categories
+    (
+        "PriceHistoryApp",
+        "https://pricehistoryapp.com/deals/category/clothing",
+    ),
+    (
+        "PriceHistoryApp",
+        "https://pricehistoryapp.com/deals/category/footwear",
+    ),
+    (
+        "PriceHistoryApp",
+        "https://pricehistoryapp.com/deals/category/electronics",
+    ),
+    (
+        "PriceHistoryApp",
+        "https://pricehistoryapp.com/deals/category/home",
+    ),
+    (
+        "PriceHistoryApp",
+        "https://pricehistoryapp.com/deals/category/kitchen",
+    ),
+    (
+        "PriceHistoryApp",
+        "https://pricehistoryapp.com/deals/category/mobiles-accessories",
+    ),
+    (
+        "PriceHistoryApp",
+        "https://pricehistoryapp.com/deals/category/bags-accessories",
+    ),
+    (
+        "PriceHistoryApp",
+        "https://pricehistoryapp.com/deals/category/jewellery-watches",
+    ),
+    (
+        "PriceHistoryApp",
+        "https://pricehistoryapp.com/deals/category/sports-outdoors",
+    ),
+
+    # PriceTrail categories
+    (
+        "PriceTrail",
+        "https://pricehistorytracker.in/latest-deals?category=fashion",
+    ),
+    (
+        "PriceTrail",
+        "https://pricehistorytracker.in/latest-deals?category=footwear",
+    ),
+    (
+        "PriceTrail",
+        "https://pricehistorytracker.in/latest-deals?category=electronics",
+    ),
+    (
+        "PriceTrail",
+        "https://pricehistorytracker.in/latest-deals?category=home-kitchen",
+    ),
+    (
+        "PriceTrail",
+        "https://pricehistorytracker.in/latest-deals?category=mobiles",
+    ),
+]
+
+
+# ============================================================
+# PAGINATION PATTERNS
+# ============================================================
+
 PAGE_PATTERNS = [
     "?page={}",
     "?page={}&store=flipkart",
     "?page={}&store=myntra",
+    "&page={}",
     "/page/{}",
 ]
 
@@ -177,8 +267,6 @@ def normalise_store(text):
 def clean_url(url):
     parsed = urlparse(url)
 
-    # Remove query and fragment so the same product
-    # doesn't appear repeatedly with tracking parameters.
     return urlunparse(
         (
             parsed.scheme,
@@ -192,7 +280,7 @@ def clean_url(url):
 
 
 # ============================================================
-# PRODUCT LINK DETECTION
+# PRODUCT URL DETECTION
 # ============================================================
 
 def looks_like_product_url(url):
@@ -206,6 +294,9 @@ def looks_like_product_url(url):
         "/pricehistory/",
         "/track/",
         "/tracker/",
+        "/price-history",
+        "/pricehistory",
+        "/product",
     ]
 
     return any(
@@ -213,6 +304,10 @@ def looks_like_product_url(url):
         for word in product_words
     )
 
+
+# ============================================================
+# TRACKER DOMAIN
+# ============================================================
 
 def is_tracker_domain(url):
     host = urlparse(url).netloc.lower()
@@ -229,9 +324,14 @@ def is_tracker_domain(url):
     )
 
 
+# ============================================================
+# PRODUCT LINK DETECTION
+# ============================================================
+
 def extract_product_links(
     soup,
     base_url,
+    source_name,
 ):
     results = []
     seen = set()
@@ -248,11 +348,6 @@ def extract_product_links(
         if not is_tracker_domain(href):
             continue
 
-        if not looks_like_product_url(
-            href
-        ):
-            continue
-
         href = clean_url(href)
 
         if href in seen:
@@ -262,14 +357,20 @@ def extract_product_links(
             link.stripped_strings
         )
 
-        store = normalise_store(
-            text
+        combined = (
+            href.lower()
+            + " "
+            + text.lower()
         )
 
-        if store is None:
-            store = normalise_store(
-                href
-            )
+        # Must look like an actual product page.
+        if not looks_like_product_url(href):
+            continue
+
+        # Determine store from URL/text.
+        store = normalise_store(
+            combined
+        )
 
         if store not in (
             "Flipkart",
@@ -284,6 +385,7 @@ def extract_product_links(
                 "tracker_url": href,
                 "store": store,
                 "anchor_text": text,
+                "source": source_name,
             }
         )
 
@@ -291,7 +393,7 @@ def extract_product_links(
 
 
 # ============================================================
-# DISCOVER PAGINATION LINKS
+# PAGINATION LINK DETECTION
 # ============================================================
 
 def extract_pagination_links(
@@ -328,6 +430,7 @@ def extract_pagination_links(
                 "older",
                 ">",
                 "»",
+                "›",
             )
         )
 
@@ -340,6 +443,7 @@ def extract_pagination_links(
             continue
 
         seen.add(href)
+
         links.append(href)
 
     return links
@@ -358,8 +462,8 @@ def discover_page(
 
     except Exception as error:
         print(
-            f"[{source_name}] "
-            f"FAILED: {url} -> {error}"
+            f"[{source_name}] FAILED: "
+            f"{url} -> {error}"
         )
 
         return [], []
@@ -367,6 +471,7 @@ def discover_page(
     products = extract_product_links(
         soup,
         url,
+        source_name,
     )
 
     pagination = extract_pagination_links(
@@ -378,17 +483,65 @@ def discover_page(
 
 
 # ============================================================
+# CONVENTIONAL PAGE URL
+# ============================================================
+
+def generate_page_urls(
+    source_name,
+    base_url,
+):
+    urls = []
+
+    parsed = urlparse(base_url)
+
+    # Don't generate nonsense page combinations
+    # for obviously non-listing product URLs.
+    if looks_like_product_url(base_url):
+        return urls
+
+    for page_number in range(
+        2,
+        MAX_PAGES_PER_SOURCE + 1,
+    ):
+        for pattern in PAGE_PATTERNS:
+
+            candidate = (
+                base_url.rstrip("/")
+                + pattern.format(
+                    page_number
+                )
+            )
+
+            # Keep source identity.
+            urls.append(
+                (
+                    source_name,
+                    candidate,
+                )
+            )
+
+    return urls
+
+
+# ============================================================
 # MASS DISCOVERY
 # ============================================================
 
 def discover_products():
+
     queue = []
     queued = set()
 
-    for (
-        source_name,
-        url,
-    ) in SOURCE_PAGES:
+    # Start with normal source pages.
+    all_sources = (
+        SOURCE_PAGES
+        + EXTRA_SOURCE_PAGES
+    )
+
+    for source_name, url in all_sources:
+
+        if url in queued:
+            continue
 
         queue.append(
             (
@@ -403,25 +556,17 @@ def discover_products():
     processed_pages = set()
 
     print("")
-    print(
-        "========================================"
-    )
-    print(
-        "STARTING HIGH-COVERAGE DISCOVERY"
-    )
-    print(
-        "Target products: "
-        f"{TARGET_PRODUCTS}"
-    )
-    print(
-        "Discovery target: "
-        f"{DISCOVERY_TARGET}"
-    )
-    print(
-        "========================================"
-    )
+    print("=" * 60)
+    print("STARTING HIGH-COVERAGE DISCOVERY")
+    print(f"Target products: {TARGET_PRODUCTS}")
+    print(f"Discovery target: {DISCOVERY_TARGET}")
+    print("=" * 60)
 
-    while queue and len(discovered) < DISCOVERY_TARGET:
+    while (
+        queue
+        and len(discovered)
+        < DISCOVERY_TARGET
+    ):
 
         source_name, url = queue.pop(0)
 
@@ -435,6 +580,10 @@ def discover_products():
             url,
         )
 
+        # ----------------------------------------------------
+        # SAVE PRODUCTS
+        # ----------------------------------------------------
+
         for product in products:
 
             product_url = product[
@@ -446,58 +595,102 @@ def discover_products():
                     product_url
                 ] = product
 
+            else:
+                # Product found on multiple sources.
+                # Preserve source information.
+                old = discovered[
+                    product_url
+                ]
+
+                old_sources = set(
+                    old.get(
+                        "sources",
+                        [],
+                    )
+                )
+
+                old_sources.add(
+                    product.get(
+                        "source",
+                        source_name,
+                    )
+                )
+
+                old[
+                    "sources"
+                ] = sorted(
+                    old_sources
+                )
+
+        # ----------------------------------------------------
+        # FOLLOW REAL PAGINATION
+        # ----------------------------------------------------
+
+        for next_url in pagination:
+
+            if next_url in queued:
+                continue
+
+            if next_url in processed_pages:
+                continue
+
+            queued.add(next_url)
+
+            queue.append(
+                (
+                    source_name,
+                    next_url,
+                )
+            )
+
+        # ----------------------------------------------------
+        # ADD CONVENTIONAL PAGINATION
+        #
+        # Only do this for source/listing pages.
+        # ----------------------------------------------------
+
+        if (
+            len(discovered)
+            < DISCOVERY_TARGET
+        ):
+
+            generated = generate_page_urls(
+                source_name,
+                url,
+            )
+
+            for (
+                generated_source,
+                candidate,
+            ) in generated:
+
+                if candidate in queued:
+                    continue
+
+                if candidate in processed_pages:
+                    continue
+
+                queued.add(candidate)
+
+                queue.append(
+                    (
+                        generated_source,
+                        candidate,
+                    )
+                )
+
+                # Prevent an enormous queue.
+                if len(queue) >= 250:
+                    break
+
         print(
             f"[DISCOVERY] "
             f"{source_name} | "
             f"products={len(products)} | "
             f"total={len(discovered)} | "
-            f"pages={len(processed_pages)}"
+            f"pages={len(processed_pages)} | "
+            f"queue={len(queue)}"
         )
-
-        # Follow discovered pagination.
-        for next_url in pagination:
-
-            if next_url not in queued:
-                queued.add(next_url)
-
-                queue.append(
-                    (
-                        source_name,
-                        next_url,
-                    )
-                )
-
-        # If a site doesn't expose pagination links,
-        # try conventional page-number URLs.
-        if len(discovered) < DISCOVERY_TARGET:
-
-            for page_number in range(
-                2,
-                51,
-            ):
-
-                for pattern in PAGE_PATTERNS:
-
-                    candidate = (
-                        url.rstrip("/")
-                        + pattern.format(
-                            page_number
-                        )
-                    )
-
-                    if candidate not in queued:
-                        queued.add(candidate)
-
-                        queue.append(
-                            (
-                                source_name,
-                                candidate,
-                            )
-                        )
-
-                # Don't flood queue unnecessarily.
-                if len(queue) > 150:
-                    break
 
         time.sleep(
             REQUEST_DELAY
@@ -507,10 +700,49 @@ def discover_products():
         discovered.values()
     )
 
-    print("")
-    print(
-        "DISCOVERY FINISHED"
+    # --------------------------------------------------------
+    # RANDOMISE SOURCE ORDER SLIGHTLY
+    #
+    # This prevents one source from completely dominating
+    # the first 1,000 products.
+    # --------------------------------------------------------
+
+    flipkart = [
+        p for p in products
+        if p.get("store") == "Flipkart"
+    ]
+
+    myntra = [
+        p for p in products
+        if p.get("store") == "Myntra"
+    ]
+
+    # Interleave the two stores.
+    balanced = []
+
+    max_len = max(
+        len(flipkart),
+        len(myntra),
     )
+
+    for i in range(max_len):
+
+        if i < len(flipkart):
+            balanced.append(
+                flipkart[i]
+            )
+
+        if i < len(myntra):
+            balanced.append(
+                myntra[i]
+            )
+
+    products = balanced
+
+    print("")
+    print("=" * 60)
+    print("DISCOVERY FINISHED")
+    print("=" * 60)
     print(
         f"Pages visited: "
         f"{len(processed_pages)}"
@@ -518,6 +750,14 @@ def discover_products():
     print(
         f"Unique products discovered: "
         f"{len(products)}"
+    )
+    print(
+        f"Flipkart discovered: "
+        f"{len(flipkart)}"
+    )
+    print(
+        f"Myntra discovered: "
+        f"{len(myntra)}"
     )
 
     return products
@@ -563,42 +803,52 @@ def find_current_price(text):
 def find_average(text):
 
     patterns = [
+
+        # 30-day
         (
             30,
             r"30d\s*Average\s*:?\s*"
             r"(?:₹|Rs\.?|INR)\s*"
             r"([0-9][0-9,]*(?:\.[0-9]+)?)",
         ),
+
         (
             30,
             r"30-day\s*average\s*:?\s*"
             r"(?:₹|Rs\.?|INR)\s*"
             r"([0-9][0-9,]*(?:\.[0-9]+)?)",
         ),
+
         (
             30,
             r"30\s*day\s*average\s*:?\s*"
             r"(?:₹|Rs\.?|INR)\s*"
             r"([0-9][0-9,]*(?:\.[0-9]+)?)",
         ),
+
+        # 90-day
         (
             90,
             r"90d\s*Average\s*:?\s*"
             r"(?:₹|Rs\.?|INR)\s*"
             r"([0-9][0-9,]*(?:\.[0-9]+)?)",
         ),
+
         (
             90,
             r"90-day\s*average\s*:?\s*"
             r"(?:₹|Rs\.?|INR)\s*"
             r"([0-9][0-9,]*(?:\.[0-9]+)?)",
         ),
+
         (
             90,
             r"90\s*day\s*average\s*:?\s*"
             r"(?:₹|Rs\.?|INR)\s*"
             r"([0-9][0-9,]*(?:\.[0-9]+)?)",
         ),
+
+        # Generic
         (
             0,
             r"Average\s*price\s*:?\s*"
@@ -616,6 +866,7 @@ def find_average(text):
         )
 
         if match:
+
             return (
                 float(
                     match.group(1)
@@ -642,8 +893,7 @@ def find_buy_link(
         else "myntra.com"
     )
 
-    # Prefer a link whose text actually says
-    # Flipkart/Myntra/Buy.
+    # Prefer BUY / SHOP links.
     for link in soup.find_all(
         "a",
         href=True,
@@ -665,7 +915,7 @@ def find_buy_link(
         ):
             return href
 
-    # Fallback: any direct retailer URL.
+    # Fallback.
     for link in soup.find_all(
         "a",
         href=True,
@@ -683,9 +933,7 @@ def find_buy_link(
 # READ PRODUCT
 # ============================================================
 
-def parse_product(
-    candidate,
-):
+def parse_product(candidate):
 
     url = candidate[
         "tracker_url"
@@ -911,18 +1159,10 @@ def send_telegram(
 def main():
 
     print("")
-    print(
-        "========================================"
-    )
-    print(
-        "       VIBHU PRICE SNIPER"
-    )
-    print(
-        "       1000+ PRODUCT SCANNER"
-    )
-    print(
-        "========================================"
-    )
+    print("=" * 60)
+    print("       VIBHU PRICE SNIPER")
+    print("       1000+ PRODUCT SCANNER")
+    print("=" * 60)
 
     if not os.environ.get(
         "TELEGRAM_BOT_TOKEN"
@@ -940,19 +1180,22 @@ def main():
 
     state = load_state()
 
-    # --------------------------------------------------------
+    # ========================================================
     # DISCOVERY
-    # --------------------------------------------------------
+    # ========================================================
 
     candidates = discover_products()
 
-    if len(candidates) < TARGET_PRODUCTS:
+    discovered_count = len(
+        candidates
+    )
+
+    if discovered_count < TARGET_PRODUCTS:
+
         print("")
+        print("WARNING")
         print(
-            "WARNING:"
-        )
-        print(
-            f"Only {len(candidates)} "
+            f"Only {discovered_count} "
             "products were discovered."
         )
         print(
@@ -960,37 +1203,36 @@ def main():
             "1,000 unique products to this run."
         )
 
-    # Take at least the first 1,000 when available.
+    # Only check TARGET_PRODUCTS.
     candidates = candidates[
         :TARGET_PRODUCTS
     ]
 
     print("")
-    print(
-        "========================================"
-    )
+    print("=" * 60)
     print(
         f"PRODUCT PAGES TO CHECK: "
         f"{len(candidates)}"
     )
-    print(
-        "========================================"
-    )
+    print("=" * 60)
 
-    # --------------------------------------------------------
+    # ========================================================
     # READ PRODUCTS
-    # --------------------------------------------------------
+    # ========================================================
 
     grouped = {}
 
     successful = 0
     failed = 0
+    above_price = 0
+    unreadable = 0
 
     for index, candidate in enumerate(
         candidates,
         start=1,
     ):
-     try:
+
+        try:
 
             item = parse_product(
                 candidate
@@ -1008,15 +1250,30 @@ def main():
             continue
 
         if not item:
+
+            unreadable += 1
+
             continue
 
         successful += 1
 
-        # We don't need expensive processing
-        # for products already above ₹5,000.
+        # Products above ₹5,000 do not need
+        # further deal processing.
         if item[
             "current"
         ] > MAX_PRICE:
+
+            above_price += 1
+
+            if index % 25 == 0:
+                print(
+                    f"Progress: "
+                    f"{index}/{len(candidates)} "
+                    f"| read={successful} "
+                    f"| failed={failed} "
+                    f"| above ₹5k={above_price}"
+                )
+
             continue
 
         key = product_key(
@@ -1030,13 +1287,35 @@ def main():
                 "evidence": set(),
             }
 
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # Use source safely.
+        #
+        # The previous version used:
+        # candidate["source"]
+        #
+        # but source was never guaranteed.
+        # ----------------------------------------------------
+
+        source_name = candidate.get(
+            "source",
+            "Unknown",
+        )
+
         grouped[key][
             "evidence"
         ].add(
-            candidate[
-                "source"
-            ]
+            source_name
         )
+
+        # Add any additional source evidence.
+        for source in candidate.get(
+            "sources",
+            [],
+        ):
+            grouped[key][
+                "evidence"
+            ].add(source)
 
         old = grouped[key][
             "item"
@@ -1051,28 +1330,30 @@ def main():
                 "average_days"
             ] != 30
         ):
+
             grouped[key][
                 "item"
             ] = item
 
-        if (
-            index % 25 == 0
-        ):
+        if index % 25 == 0:
+
             print(
                 f"Progress: "
                 f"{index}/{len(candidates)} "
                 f"pages checked | "
                 f"read={successful} | "
-                f"failed={failed}"
+                f"failed={failed} | "
+                f"above ₹5k={above_price} | "
+                f"usable={len(grouped)}"
             )
 
         time.sleep(
             REQUEST_DELAY
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # DEAL FILTER
-    # --------------------------------------------------------
+    # ========================================================
 
     qualified = 0
     alerts = 0
@@ -1122,8 +1403,8 @@ def main():
             state_key
         )
 
-        # Repeat after 7 days only if price
-        # has not become lower.
+        # Don't repeat the same deal for 7 days
+        # unless the price becomes lower.
         if (
             previous
             and previous.get(
@@ -1175,27 +1456,30 @@ def main():
             0.4
         )
 
+    # ========================================================
+    # SAVE STATE
+    # ========================================================
+
     save_state(
         state
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # FINAL REPORT
-    # --------------------------------------------------------
+    # ========================================================
 
     print("")
-    print(
-        "========================================"
-    )
-    print(
-        "             FINAL REPORT"
-    )
-    print(
-        "========================================"
-    )
+    print("=" * 60)
+    print("             FINAL REPORT")
+    print("=" * 60)
 
     print(
         f"Products discovered: "
+        f"{discovered_count}"
+    )
+
+    print(
+        f"Product pages selected: "
         f"{len(candidates)}"
     )
 
@@ -1207,6 +1491,16 @@ def main():
     print(
         f"Product pages failed: "
         f"{failed}"
+    )
+
+    print(
+        f"Products unreadable/no price data: "
+        f"{unreadable}"
+    )
+
+    print(
+        f"Products above ₹5,000: "
+        f"{above_price}"
     )
 
     print(
@@ -1224,11 +1518,8 @@ def main():
         f"{alerts}"
     )
 
-    print(
-        "========================================"
-    )
+    print("=" * 60)
 
 
 if __name__ == "__main__":
     main()
-      
