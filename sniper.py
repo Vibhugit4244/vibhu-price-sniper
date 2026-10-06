@@ -1,10 +1,10 @@
 import os
 import re
 import json
-import time
 import html
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -15,24 +15,37 @@ from bs4 import BeautifulSoup
 # ============================================================
 
 MAX_PRICE = 5000
-DISCOUNT_FROM_AVERAGE = 0.50
+MAX_AVERAGE_RATIO = 0.50
 
-# We aim to inspect up to this many UNIQUE product pages.
 TARGET_PRODUCTS = 1000
-
-# Number of product pages checked at the same time.
 WORKERS = 12
 
-# Never wait too long for one website request.
 REQUEST_TIMEOUT = 12
-
-# Small pause between listing-page requests.
-LISTING_DELAY = 0.5
+LISTING_TIMEOUT = 15
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 STATE_FILE = "state.json"
+
+
+# ============================================================
+# PUBLIC DEAL / HISTORY SOURCES
+# ============================================================
+
+SOURCE_PAGES = [
+    "https://pricehistoryapp.com/deals",
+    "https://pricehistoryapp.com/latest-deals",
+    "https://pricehistoryapp.com/deals/store/flipkart",
+    "https://pricehistoryapp.com/deals/store/myntra",
+
+    "https://pricedropy.com/",
+    "https://pricedropy.com/flipkart-price-history",
+    "https://pricedropy.com/myntra-price-history",
+
+    "https://pricehistorytracker.in/",
+    "https://pricehistorytracker.in/latest-deals",
+]
 
 
 # ============================================================
@@ -44,48 +57,44 @@ SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": (
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,*/*;q=0.8"
+    ),
     "Accept-Language": "en-IN,en;q=0.9",
-    "Connection": "keep-alive",
 })
 
 
-# ============================================================
-# SOURCES
-#
-# These are real public listing/deal pages.
-# We do NOT blindly generate thousands of page numbers.
-# ============================================================
+def fetch(url, timeout=REQUEST_TIMEOUT):
+    try:
+        r = SESSION.get(
+            url,
+            timeout=timeout,
+            allow_redirects=True
+        )
 
-SOURCE_PAGES = [
-    # PriceHistoryApp
-    "https://pricehistoryapp.com/deals",
-    "https://pricehistoryapp.com/deals/store/flipkart",
-    "https://pricehistoryapp.com/deals/store/myntra",
+        if r.status_code != 200:
+            return None
 
-    # PriceDropy
-    "https://pricedropy.com/",
-    "https://pricedropy.com/flipkart-price-history",
-    "https://pricedropy.com/myntra-price-history",
+        return r.text
 
-    # PriceTrail / PriceHistoryTracker
-    "https://pricehistorytracker.in/",
-    "https://pricehistorytracker.in/latest-deals",
-]
+    except Exception:
+        return None
 
 
 # ============================================================
-# HELPERS
+# URL HELPERS
 # ============================================================
 
 def clean_url(url):
     if not url:
         return None
 
-    url = html.unescape(url).strip()
+    url = html.unescape(str(url)).strip()
 
     if url.startswith("//"):
         url = "https:" + url
@@ -95,28 +104,21 @@ def clean_url(url):
 
     parsed = urlparse(url)
 
-    # Remove tracking/query parameters.
-    clean = parsed._replace(query="", fragment="").geturl()
-
-    return clean.rstrip("/")
-
-
-def domain(url):
-    try:
-        return urlparse(url).netloc.lower()
-    except Exception:
-        return ""
+    return parsed._replace(
+        query="",
+        fragment=""
+    ).geturl().rstrip("/")
 
 
 def is_flipkart(url):
-    return "flipkart.com" in domain(url)
+    return "flipkart.com" in urlparse(url).netloc.lower()
 
 
 def is_myntra(url):
-    return "myntra.com" in domain(url)
+    return "myntra.com" in urlparse(url).netloc.lower()
 
 
-def retailer_from_url(url):
+def retailer(url):
     if is_flipkart(url):
         return "Flipkart"
 
@@ -126,347 +128,521 @@ def retailer_from_url(url):
     return None
 
 
-def money(value):
-    if value is None:
-        return None
+# ============================================================
+# RETAILER PRODUCT DETECTION
+# ============================================================
 
-    value = str(value)
+def is_retailer_product(url):
 
-    # Handle ₹1,499 / Rs 1499 / 1499
-    m = re.search(r"(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d+)?)", value, re.I)
+    r = retailer(url)
 
-    if not m:
-        return None
+    if not r:
+        return False
 
-    try:
-        return float(m.group(1).replace(",", ""))
-    except Exception:
-        return None
+    path = urlparse(url).path.lower()
 
-
-def get(url):
-    try:
-        response = SESSION.get(
-            url,
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=True
+    if r == "Flipkart":
+        return (
+            "/p/" in path
+            or "/product/" in path
+            or "/item/" in path
         )
 
-        if response.status_code != 200:
-            return None
+    if r == "Myntra":
+        return (
+            "/buy" in path
+            or "/product/" in path
+            or bool(re.search(r"-\d{5,}$", path))
+        )
 
-        return response.text
+    return False
 
-    except Exception:
-        return None
+
+# ============================================================
+# TRACKER PRODUCT PAGE DETECTION
+# ============================================================
+
+def is_tracker_page(url):
+
+    host = urlparse(url).netloc.lower()
+    path = urlparse(url).path.lower()
+
+    if "pricehistoryapp.com" in host:
+        return (
+            "/product/" in path
+            or "/price-history/" in path
+            or "/flipkart/" in path
+            or "/myntra/" in path
+            or "/track/" in path
+        )
+
+    if "pricedropy.com" in host:
+        return (
+            "/product/" in path
+            or "/price-history/" in path
+            or "/flipkart/" in path
+            or "/myntra/" in path
+            or "/track/" in path
+        )
+
+    if "pricehistorytracker.in" in host:
+        return (
+            "/product/" in path
+            or "/price-history/" in path
+            or "/flipkart/" in path
+            or "/myntra/" in path
+            or "/track/" in path
+            or "/tracker/" in path
+        )
+
+    return False
+
+
+# ============================================================
+# LINK EXTRACTION
+# ============================================================
+
+def extract_links(base_url, source_html):
+
+    soup = BeautifulSoup(source_html, "html.parser")
+
+    links = set()
+
+    for a in soup.find_all("a", href=True):
+
+        href = a.get("href")
+
+        if not href:
+            continue
+
+        full = clean_url(urljoin(base_url, href))
+
+        if not full:
+            continue
+
+        if is_retailer_product(full) or is_tracker_page(full):
+            links.add(full)
+
+    # Also search raw HTML.
+    patterns = [
+        r'https?://[^"\'>\s]+',
+        r'["\'](/[^"\']+)["\']'
+    ]
+
+    for pattern in patterns:
+
+        for match in re.findall(pattern, source_html):
+
+            if match.startswith("/"):
+                full = clean_url(urljoin(base_url, match))
+            else:
+                full = clean_url(match)
+
+            if not full:
+                continue
+
+            if is_retailer_product(full) or is_tracker_page(full):
+                links.add(full)
+
+    return links
 
 
 # ============================================================
 # DISCOVERY
 # ============================================================
 
-def looks_like_retailer_product(url):
-    """
-    We only accept URLs which point directly to Flipkart or Myntra.
+def discover():
 
-    This prevents us from accidentally treating tracker pages,
-    category pages, articles, etc. as products.
-    """
+    tracker_pages = set()
+    retailer_pages = set()
 
-    if not (is_flipkart(url) or is_myntra(url)):
-        return False
-
-    path = urlparse(url).path.lower()
-
-    if is_flipkart(url):
-        # Typical Flipkart product URLs contain /p/
-        if "/p/" in path:
-            return True
-
-        # Some Flipkart links can use product/item style URLs.
-        if "/product/" in path or "/item/" in path:
-            return True
-
-    if is_myntra(url):
-        # Myntra product URLs normally contain /buy
-        # or a product path ending in a numeric product ID.
-        if "/buy" in path:
-            return True
-
-        if re.search(r"-\d{5,}$", path):
-            return True
-
-        if "/product/" in path:
-            return True
-
-    return False
-
-
-def extract_links(page_url, page_html):
-    """
-    Extract direct Flipkart/Myntra links from a listing page.
-    """
-
-    found = set()
-
-    soup = BeautifulSoup(page_html, "html.parser")
-
-    # Normal <a href="">
-    for a in soup.find_all("a", href=True):
-        href = a.get("href")
-
-        if not href:
-            continue
-
-        full = urljoin(page_url, href)
-        full = clean_url(full)
-
-        if full and looks_like_retailer_product(full):
-            found.add(full)
-
-    # Also inspect raw HTML because some sites put links
-    # inside JSON / JavaScript.
-    patterns = [
-        r'https?://(?:www\.)?flipkart\.com/[^\s"\'<>\\]+',
-        r'https?://(?:www\.)?myntra\.com/[^\s"\'<>\\]+',
-    ]
-
-    for pattern in patterns:
-        for match in re.findall(pattern, page_html, re.I):
-            full = clean_url(match)
-
-            if full and looks_like_retailer_product(full):
-                found.add(full)
-
-    return found
-
-
-def discover_products():
-    all_products = set()
-
-    print("===================================================")
-    print("DISCOVERY STARTED")
-    print("===================================================")
+    print()
+    print("==========================================")
+    print("DISCOVERY")
+    print("==========================================")
 
     for source in SOURCE_PAGES:
 
-        if len(all_products) >= TARGET_PRODUCTS:
-            break
+        print()
+        print("Source:", source)
 
-        print(f"\nSource: {source}")
+        page = fetch(
+            source,
+            timeout=LISTING_TIMEOUT
+        )
 
-        page_html = get(source)
-
-        if not page_html:
-            print("  Could not read source")
+        if not page:
+            print("Could not read source")
             continue
 
-        links = extract_links(source, page_html)
+        links = extract_links(
+            source,
+            page
+        )
 
-        before = len(all_products)
+        before_tracker = len(tracker_pages)
+        before_retailer = len(retailer_pages)
 
         for link in links:
-            all_products.add(link)
 
-            if len(all_products) >= TARGET_PRODUCTS:
-                break
+            if is_tracker_page(link):
+                tracker_pages.add(link)
 
-        added = len(all_products) - before
+            elif is_retailer_product(link):
+                retailer_pages.add(link)
 
-        print(f"  New retailer products: {added}")
-        print(f"  Total unique products: {len(all_products)}")
+        print(
+            "New tracker pages:",
+            len(tracker_pages) - before_tracker
+        )
 
-        time.sleep(LISTING_DELAY)
+        print(
+            "New retailer pages:",
+            len(retailer_pages) - before_retailer
+        )
 
-    print("\n===================================================")
-    print(f"DISCOVERY COMPLETE: {len(all_products)} products")
-    print("===================================================")
+        print(
+            "Total tracker pages:",
+            len(tracker_pages)
+        )
 
-    return list(all_products)[:TARGET_PRODUCTS]
+        print(
+            "Total retailer pages:",
+            len(retailer_pages)
+        )
+
+        if len(tracker_pages) >= TARGET_PRODUCTS:
+            break
+
+    print()
+    print("Discovery complete")
+    print("Tracker pages:", len(tracker_pages))
+    print("Retailer pages:", len(retailer_pages))
+
+    return list(tracker_pages), list(retailer_pages)
 
 
 # ============================================================
-# PRODUCT PARSING
+# MONEY
 # ============================================================
 
-def json_ld_objects(soup):
-    objects = []
+def money(value):
+
+    if value is None:
+        return None
+
+    value = str(value)
+
+    match = re.search(
+        r"(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d+)?)",
+        value,
+        re.I
+    )
+
+    if not match:
+        return None
+
+    try:
+        return float(
+            match.group(1).replace(",", "")
+        )
+    except Exception:
+        return None
+
+
+# ============================================================
+# JSON-LD
+# ============================================================
+
+def json_ld(soup):
+
+    result = []
 
     for script in soup.find_all(
         "script",
-        attrs={"type": re.compile(r"ld\+json", re.I)}
+        attrs={"type": re.compile("ld\\+json", re.I)}
     ):
+
         try:
-            data = json.loads(script.string or script.get_text())
+            data = json.loads(
+                script.string or script.get_text()
+            )
 
             if isinstance(data, list):
-                objects.extend(data)
+                result.extend(data)
             else:
-                objects.append(data)
+                result.append(data)
 
         except Exception:
             pass
 
-    return objects
+    return result
 
 
-def find_prices(text):
-    """
-    Extract possible ₹ prices from visible page text.
-    """
+# ============================================================
+# NUMBER EXTRACTION
+# ============================================================
 
-    prices = []
+def all_prices(text):
 
-    for m in re.findall(
-        r"(?:₹|Rs\.?|INR)\s*([\d,]+(?:\.\d+)?)",
-        text,
-        re.I
-    ):
-        value = money(m)
+    values = []
 
-        if value is not None and 1 <= value <= 1000000:
-            prices.append(value)
+    patterns = [
+        r"₹\s*([\d,]+(?:\.\d+)?)",
+        r"Rs\.?\s*([\d,]+(?:\.\d+)?)",
+        r"INR\s*([\d,]+(?:\.\d+)?)",
+    ]
 
-    return prices
+    for pattern in patterns:
+
+        for x in re.findall(
+            pattern,
+            text,
+            re.I
+        ):
+
+            v = money(x)
+
+            if v is not None and 1 <= v <= 1000000:
+                values.append(v)
+
+    return values
 
 
-def parse_product(url):
-    page_html = get(url)
+# ============================================================
+# FIND LABELLED PRICE
+# ============================================================
 
-    if not page_html:
+def labelled_price(text, labels):
+
+    lower = text.lower()
+
+    for label in labels:
+
+        pattern = (
+            re.escape(label)
+            + r".{0,120}?"
+            r"(?:₹|rs\.?|inr)?\s*"
+            r"([\d,]+(?:\.\d+)?)"
+        )
+
+        m = re.search(
+            pattern,
+            lower,
+            re.I
+        )
+
+        if m:
+
+            value = money(m.group(1))
+
+            if value is not None:
+                return value
+
+    return None
+
+
+# ============================================================
+# PARSE TRACKER PAGE
+# ============================================================
+
+def parse_tracker(url):
+
+    page = fetch(url)
+
+    if not page:
         return None
 
-    soup = BeautifulSoup(page_html, "html.parser")
+    soup = BeautifulSoup(
+        page,
+        "html.parser"
+    )
 
-    text = soup.get_text(" ", strip=True)
+    text = soup.get_text(
+        " ",
+        strip=True
+    )
 
     # --------------------------------------------------------
-    # Product name
+    # TITLE
     # --------------------------------------------------------
 
     title = None
 
-    og_title = soup.find(
+    og = soup.find(
         "meta",
         attrs={"property": "og:title"}
     )
 
-    if og_title and og_title.get("content"):
-        title = og_title["content"].strip()
+    if og and og.get("content"):
+        title = og["content"].strip()
 
     if not title:
-        title_tag = soup.find("title")
 
-        if title_tag:
-            title = title_tag.get_text(" ", strip=True)
+        tag = soup.find("title")
+
+        if tag:
+            title = tag.get_text(
+                " ",
+                strip=True
+            )
 
     # --------------------------------------------------------
-    # JSON-LD structured data
+    # DIRECT RETAILER LINK
     # --------------------------------------------------------
 
-    current_price = None
+    buy_url = None
 
-    for obj in json_ld_objects(soup):
+    for a in soup.find_all(
+        "a",
+        href=True
+    ):
 
-        if not isinstance(obj, dict):
+        href = a.get("href")
+
+        full = clean_url(
+            urljoin(url, href)
+        )
+
+        if not full:
             continue
 
-        offers = obj.get("offers")
+        if is_retailer_product(full):
 
-        if isinstance(offers, dict):
-            price = offers.get("price")
-
-            if price:
-                current_price = money(price)
-
-        elif isinstance(offers, list):
-            for offer in offers:
-                if isinstance(offer, dict) and offer.get("price"):
-                    current_price = money(offer["price"])
-                    break
-
-        if not title and obj.get("name"):
-            title = str(obj["name"]).strip()
-
-    # --------------------------------------------------------
-    # Visible prices
-    # --------------------------------------------------------
-
-    prices = find_prices(text)
-
-    # Use the lowest sensible price as current price if
-    # structured data did not provide it.
-    if current_price is None and prices:
-        sensible = [p for p in prices if p <= 100000]
-        if sensible:
-            current_price = min(sensible)
-
-    if current_price is None:
-        return None
-
-    # --------------------------------------------------------
-    # Historical average
-    #
-    # Tracker pages may expose average values in text.
-    # Look specifically for common average labels first.
-    # --------------------------------------------------------
-
-    average = None
-
-    average_patterns = [
-        r"30\s*day\s*average.{0,80}?(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d+)?)",
-        r"30d\s*average.{0,80}?(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d+)?)",
-        r"90\s*day\s*average.{0,80}?(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d+)?)",
-        r"90d\s*average.{0,80}?(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d+)?)",
-        r"historical\s*average.{0,80}?(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d+)?)",
-        r"average\s*(?:selling\s*)?price.{0,80}?(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d+)?)",
-    ]
-
-    lower = text.lower()
-
-    for pattern in average_patterns:
-        match = re.search(pattern, lower, re.I)
-
-        if match:
-            average = money(match.group(1))
+            buy_url = full
             break
 
-    # --------------------------------------------------------
-    # If tracker source has an average in embedded text,
-    # inspect the raw HTML too.
-    # --------------------------------------------------------
+    # Search raw HTML too.
+    if not buy_url:
 
-    if average is None:
-        for pattern in average_patterns:
-            match = re.search(pattern, page_html, re.I)
+        for match in re.findall(
+            r'https?://[^"\'>\s]+',
+            page
+        ):
 
-            if match:
-                average = money(match.group(1))
+            full = clean_url(match)
+
+            if full and is_retailer_product(full):
+
+                buy_url = full
                 break
 
-    if average is None or average <= 0:
-        return None
+    # --------------------------------------------------------
+    # RETAILER
+    # --------------------------------------------------------
 
-    retailer = retailer_from_url(url)
+    store = retailer(
+        buy_url or ""
+    )
 
-    if retailer not in ("Flipkart", "Myntra"):
+    if store not in ("Flipkart", "Myntra"):
         return None
 
     # --------------------------------------------------------
-    # Deal calculation
+    # CURRENT PRICE
     # --------------------------------------------------------
+
+    current = labelled_price(
+        text,
+        [
+            "current price",
+            "current",
+            "selling price",
+            "sale price",
+            "today's price",
+            "price today",
+            "live price",
+        ]
+    )
+
+    # JSON-LD price
+    if current is None:
+
+        for obj in json_ld(soup):
+
+            if not isinstance(obj, dict):
+                continue
+
+            offers = obj.get("offers")
+
+            if isinstance(offers, dict):
+
+                if offers.get("price"):
+                    current = money(
+                        offers["price"]
+                    )
+
+            if current is not None:
+                break
+
+    # --------------------------------------------------------
+    # HISTORICAL AVERAGE
+    # --------------------------------------------------------
+
+    average = labelled_price(
+        text,
+        [
+            "30d average",
+            "30 day average",
+            "30-day average",
+            "90d average",
+            "90 day average",
+            "90-day average",
+            "historical average",
+            "average price",
+            "typical price",
+            "typical selling price",
+        ]
+    )
+
+    # Same search in raw HTML.
+    if average is None:
+
+        average = labelled_price(
+            page,
+            [
+                "30d average",
+                "30 day average",
+                "30-day average",
+                "90d average",
+                "90 day average",
+                "90-day average",
+                "historical average",
+                "average price",
+                "typical price",
+                "typical selling price",
+            ]
+        )
+
+    # --------------------------------------------------------
+    # FALLBACK:
+    #
+    # Some public deal pages expose:
+    #
+    # current price + comparison/history price
+    #
+    # If we have no labelled average, DON'T blindly assume
+    # MRP is historical average.
+    # --------------------------------------------------------
+
+    if current is None or average is None:
+        return None
+
+    if current <= 0 or average <= 0:
+        return None
 
     qualifies = (
-        current_price <= MAX_PRICE
-        and current_price <= average * DISCOUNT_FROM_AVERAGE
+        current <= MAX_PRICE
+        and current <= average * MAX_AVERAGE_RATIO
     )
 
     return {
         "title": title or "Unknown product",
-        "current": current_price,
+        "current": current,
         "average": average,
-        "retailer": retailer,
-        "url": url,
+        "store": store,
+        "tracker_url": url,
+        "buy_url": buy_url,
         "qualifies": qualifies,
     }
 
@@ -475,14 +651,31 @@ def parse_product(url):
 # TELEGRAM
 # ============================================================
 
-def telegram_send(message, buy_url):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram secrets are missing.")
+def send_telegram(deal):
+
+    if not TELEGRAM_BOT_TOKEN:
         return False
 
-    api = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+    if not TELEGRAM_CHAT_ID:
+        return False
+
+    current = deal["current"]
+    average = deal["average"]
+
+    discount = round(
+        (1 - current / average) * 100,
+        1
+    )
+
+    message = (
+        "🔥 <b>VIBHU PRICE SNIPER</b>\n\n"
+        f"<b>{html.escape(deal['title'])}</b>\n\n"
+        f"🏪 {deal['store']}\n"
+        f"💰 Current: ₹{current:,.0f}\n"
+        f"📊 Historical average: ₹{average:,.0f}\n"
+        f"📉 Below average: {discount}%\n\n"
+        "✅ Current ≤ ₹5,000\n"
+        "✅ Current ≤ 50% of historical average"
     )
 
     keyboard = {
@@ -490,31 +683,36 @@ def telegram_send(message, buy_url):
             [
                 {
                     "text": "🛒 BUY NOW",
-                    "url": buy_url
+                    "url": deal["buy_url"]
                 }
             ]
         ]
     }
 
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "reply_markup": json.dumps(keyboard),
-        "disable_web_page_preview": False,
-    }
+    endpoint = (
+        "https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
+    )
 
     try:
+
         r = SESSION.post(
-            api,
-            data=payload,
+            endpoint,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+                "reply_markup": json.dumps(
+                    keyboard
+                ),
+                "disable_web_page_preview": False,
+            },
             timeout=15
         )
 
         return r.ok
 
-    except Exception as e:
-        print("Telegram error:", e)
+    except Exception:
         return False
 
 
@@ -523,12 +721,19 @@ def telegram_send(message, buy_url):
 # ============================================================
 
 def load_state():
+
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
+
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             data = json.load(f)
 
-        if isinstance(data, dict):
-            return data
+            if isinstance(data, dict):
+                return data
 
     except Exception:
         pass
@@ -537,7 +742,13 @@ def load_state():
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+
+    with open(
+        STATE_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
         json.dump(
             state,
             f,
@@ -552,122 +763,159 @@ def save_state(state):
 
 def main():
 
-    start = time.time()
+    started = time.time()
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("ERROR: Telegram secrets are not configured.")
+    if not TELEGRAM_BOT_TOKEN:
+        print("Telegram bot token secret missing.")
         return
 
-    products = discover_products()
-
-    if not products:
-        print("No direct Flipkart/Myntra products discovered.")
+    if not TELEGRAM_CHAT_ID:
+        print("Telegram chat ID secret missing.")
         return
 
-    print(f"\nChecking {len(products)} product pages concurrently...")
-    print(f"Workers: {WORKERS}")
+    tracker_pages, retailer_pages = discover()
 
-    state = load_state()
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Historical-price checking is performed on TRACKER pages.
+    # Direct retailer pages are retained only as a fallback
+    # discovery pool.
+    # --------------------------------------------------------
 
-    sent = set(state.get("sent", []))
+    candidates = tracker_pages[:TARGET_PRODUCTS]
 
-    checked = 0
-    qualified = 0
-    alerts = 0
+    print()
+    print("==========================================")
+    print("PRICE HISTORY CHECK")
+    print("==========================================")
+
+    print(
+        "Tracker pages to check:",
+        len(candidates)
+    )
 
     results = []
 
-    # --------------------------------------------------------
-    # Concurrent product checking
-    # --------------------------------------------------------
+    checked = 0
+    qualified = 0
 
-    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+    with ThreadPoolExecutor(
+        max_workers=WORKERS
+    ) as executor:
 
         futures = {
-            executor.submit(parse_product, url): url
-            for url in products
+            executor.submit(
+                parse_tracker,
+                url
+            ): url
+            for url in candidates
         }
 
         for future in as_completed(futures):
 
-            url = futures[future]
+            checked += 1
 
             try:
                 result = future.result()
             except Exception:
                 result = None
 
-            checked += 1
-
             if result:
+
                 results.append(result)
 
                 if result["qualifies"]:
                     qualified += 1
 
-            if checked % 50 == 0 or checked == len(products):
+            if (
+                checked % 25 == 0
+                or checked == len(candidates)
+            ):
+
                 print(
-                    f"Checked {checked}/{len(products)} | "
-                    f"Qualified {qualified}"
+                    f"Checked {checked}/"
+                    f"{len(candidates)} | "
+                    f"Valid history: {len(results)} | "
+                    f"Qualified: {qualified}"
                 )
 
     # --------------------------------------------------------
-    # Send alerts
+    # ALERTS
     # --------------------------------------------------------
+
+    state = load_state()
+
+    sent = set(
+        state.get(
+            "sent",
+            []
+        )
+    )
+
+    alerts = 0
 
     for deal in results:
 
         if not deal["qualifies"]:
             continue
 
-        # URL itself is the unique alert key.
-        key = deal["url"]
+        key = deal["buy_url"]
+
+        if not key:
+            continue
 
         if key in sent:
             continue
 
-        current = deal["current"]
-        average = deal["average"]
+        if send_telegram(deal):
 
-        discount = 0
-
-        if average > 0:
-            discount = round(
-                (1 - current / average) * 100,
-                1
-            )
-
-        message = (
-            "🔥 <b>VIBHU PRICE SNIPER DEAL</b>\n\n"
-            f"<b>{html.escape(deal['title'])}</b>\n\n"
-            f"🏪 {deal['retailer']}\n"
-            f"💰 Current: ₹{current:,.0f}\n"
-            f"📊 Historical average: ₹{average:,.0f}\n"
-            f"📉 Below average: {discount}%\n\n"
-            "✅ Current price ≤ ₹5,000\n"
-            "✅ Current price ≤ 50% of historical average"
-        )
-
-        if telegram_send(message, deal["url"]):
-            alerts += 1
             sent.add(key)
+            alerts += 1
 
-    # Keep state reasonably small.
     state["sent"] = list(sent)[-5000:]
 
     save_state(state)
 
-    elapsed = round(time.time() - start, 1)
+    elapsed = round(
+        time.time() - started,
+        1
+    )
 
-    print("\n===================================================")
+    print()
+    print("==========================================")
     print("SCAN COMPLETE")
-    print("===================================================")
-    print(f"Products discovered : {len(products)}")
-    print(f"Products checked    : {checked}")
-    print(f"Qualified deals     : {qualified}")
-    print(f"New Telegram alerts : {alerts}")
-    print(f"Time taken          : {elapsed} seconds")
-    print("===================================================")
+    print("==========================================")
+    print(
+        "Tracker products discovered:",
+        len(tracker_pages)
+    )
+    print(
+        "Direct retailer products discovered:",
+        len(retailer_pages)
+    )
+    print(
+        "Tracker products checked:",
+        checked
+    )
+    print(
+        "Valid history records:",
+        len(results)
+    )
+    print(
+        "Qualified deals:",
+        qualified
+    )
+    print(
+        "New Telegram alerts:",
+        alerts
+    )
+    print(
+        "Time:",
+        elapsed,
+        "seconds"
+    )
+    print("==========================================")
 
 
 if __name__ == "__main__":
