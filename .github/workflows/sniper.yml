@@ -11,7 +11,8 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
