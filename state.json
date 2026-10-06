@@ -232,5 +232,11 @@
     "current": 284.0,
     "average": 583.0,
     "sent_at": 1791312308
+  },
+  "Flipkart|https://www.flipkart.com/spider-man-2-standard-edition/p/itmc2593d7e1d9c7?pid=GAMGQGG4YYK87NHA&lid=LSTGAMGQGG4YYK87NHADD4AUZ": {
+    "title": "Spider-Man 2 (standard_edition)",
+    "current": 999.0,
+    "average": 2799.0,
+    "sent_at": 1791313088
   }
 }
