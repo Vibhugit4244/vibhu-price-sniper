@@ -8,9 +8,11 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-SOURCE = "https://pricehistoryapp.com/flipkart-price-history"
+DEALS_URL = "https://pricehistoryapp.com/deals/store/flipkart"
+
 MAX_PRICE = 5000
 DROP_RATIO = 0.50
+
 STATE_FILE = Path("state.json")
 
 HEADERS = {
@@ -22,175 +24,319 @@ HEADERS = {
     "Accept-Language": "en-IN,en;q=0.9",
 }
 
-def money(s):
-    if not s:
-        return None
-    m = re.search(r"(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)", s, re.I)
-    if not m:
-        return None
-    return float(m.group(1).replace(",", ""))
 
-def pct(s):
-    if not s:
+def money(text):
+    if not text:
         return None
-    m = re.search(r"(\d+(?:\.\d+)?)\s*%", s)
-    return float(m.group(1)) if m else None
+
+    match = re.search(
+        r"(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+        text,
+        re.I,
+    )
+
+    if not match:
+        return None
+
+    return float(match.group(1).replace(",", ""))
+
 
 def load_state():
     if not STATE_FILE.exists():
         return {}
+
     try:
         return json.loads(STATE_FILE.read_text())
     except Exception:
         return {}
 
+
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
+    STATE_FILE.write_text(
+        json.dumps(state, indent=2, sort_keys=True)
+    )
 
-def fetch():
-    r = requests.get(SOURCE, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    return BeautifulSoup(r.text, "html.parser")
 
-def extract_cards(soup):
-    """
-    PriceHistory currently publishes a live Flipkart price-drop list.
-    This parser intentionally uses visible text rather than private endpoints.
-    Because public HTML can change, it has several fallback patterns.
-    """
-    cards = []
+def get_soup(url):
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=30,
+    )
 
-    # Prefer article / card-like containers.
-    candidates = soup.select("article, [class*='card'], [class*='product'], [class*='deal']")
+    response.raise_for_status()
+
+    return BeautifulSoup(
+        response.text,
+        "html.parser",
+    )
+
+
+def extract_deal_links(soup):
+    deals = []
     seen = set()
 
-    for node in candidates:
-        text = " ".join(node.stripped_strings)
-        if "Flipkart" not in text and "₹" not in text:
+    for link in soup.find_all("a", href=True):
+
+        href = urljoin(DEALS_URL, link["href"])
+
+        if "/product/" not in href:
             continue
 
-        link = node.find("a", href=True)
-        href = urljoin(SOURCE, link["href"]) if link else None
-        if not href:
+        if href in seen:
             continue
 
-        prices = [money(x) for x in re.findall(r"(?:₹|Rs\.?|INR)\s*[0-9][0-9,]*(?:\.[0-9]+)?", text, re.I)]
-        prices = [x for x in prices if x is not None]
+        text = " ".join(link.stripped_strings)
 
-        if len(prices) < 2:
+        if not text:
             continue
 
-        # Usually first is current and second is reference/original.
-        current = prices[0]
-        reference = prices[1]
+        seen.add(href)
 
-        if current <= 0 or reference <= 0:
-            continue
-
-        title = ""
-        h = node.find(["h1", "h2", "h3", "h4", "h5"])
-        if h:
-            title = " ".join(h.stripped_strings)
-
-        if not title:
-            title = text[:180]
-
-        key = href.split("?")[0]
-        if key in seen:
-            continue
-        seen.add(key)
-
-        cards.append({
-            "title": title,
+        deals.append({
             "url": href,
-            "current": current,
-            "reference": reference,
-            "discount": (1 - current / reference) * 100,
-            "raw": text[:1000],
+            "text": text,
         })
 
-    return cards
+    return deals
+
+
+def extract_product(product_url):
+    soup = get_soup(product_url)
+
+    page_text = " ".join(soup.stripped_strings)
+
+    title = ""
+
+    heading = soup.find("h1")
+
+    if heading:
+        title = " ".join(
+            heading.stripped_strings
+        )
+
+    if not title:
+        title = "Flipkart product"
+
+    # Current price
+    current = None
+
+    # Look for the price near the product title.
+    # PriceHistory pages contain the current price
+    # immediately before the MRP.
+
+    title_node = soup.find("h1")
+
+    if title_node:
+        parent_text = " ".join(
+            title_node.parent.stripped_strings
+        )
+
+        prices = re.findall(
+            r"(?:₹|Rs\.?|INR)\s*[0-9][0-9,]*(?:\.[0-9]+)?",
+            parent_text,
+            re.I,
+        )
+
+        if prices:
+            current = money(prices[0])
+
+    # Fallback: use the page's Current: ₹... value.
+    if current is None:
+        match = re.search(
+            r"Current:\s*(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+            page_text,
+            re.I,
+        )
+
+        if match:
+            current = float(
+                match.group(1).replace(",", "")
+            )
+
+    # PriceHistory currently exposes a 30-day average.
+    average = None
+
+    match = re.search(
+        r"30d Average\s*(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+        page_text,
+        re.I,
+    )
+
+    if match:
+        average = float(
+            match.group(1).replace(",", "")
+        )
+
+    if current is None or average is None:
+        return None
+
+    return {
+        "title": title,
+        "url": product_url,
+        "current": current,
+        "average": average,
+    }
+
 
 def telegram(method, payload):
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    url = f"https://api.telegram.org/bot{token}/{method}"
-    r = requests.post(url, json=payload, timeout=20)
-    r.raise_for_status()
-    return r.json()
 
-def send_alert(item):
-    chat_id = os.environ["TELEGRAM_CHAT_ID"]
-
-    current = item["current"]
-    ref = item["reference"]
-    drop = (1 - current / ref) * 100
-
-    text = (
-        "🚨 <b>MEGA FLIPKART DEAL</b>\n\n"
-        f"🛍 <b>{escape(item['title'])}</b>\n\n"
-        f"💰 Current: <b>₹{current:,.0f}</b>\n"
-        f"📊 Reference: <b>₹{ref:,.0f}</b>\n"
-        f"📉 Below reference: <b>{drop:.1f}%</b>\n\n"
-        "✅ Under ₹5,000\n"
-        "✅ At least 50% below reference\n\n"
-        "⚠️ Verify seller, variant, delivery and final checkout price on Flipkart."
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{token}/{method}"
     )
 
-    telegram("sendMessage", {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-        "reply_markup": {
-            "inline_keyboard": [
-                [{"text": "🛒 BUY ON FLIPKART", "url": item["url"]}]
-            ]
-        },
-    })
+    response = requests.post(
+        url,
+        json=payload,
+        timeout=30,
+    )
 
-def escape(s):
+    response.raise_for_status()
+
+    return response.json()
+
+
+def escape_html(text):
     return (
-        str(s).replace("&", "&amp;")
+        str(text)
+        .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
 
+
+def send_alert(item):
+    current = item["current"]
+    average = item["average"]
+
+    drop = (
+        1 - (current / average)
+    ) * 100
+
+    text = (
+        "🚨 <b>MEGA FLIPKART DEAL</b>\n\n"
+        f"🛍 <b>{escape_html(item['title'])}</b>\n\n"
+        f"💰 Current: <b>₹{current:,.0f}</b>\n"
+        f"📊 30-day average: <b>₹{average:,.0f}</b>\n"
+        f"📉 Below average: <b>{drop:.1f}%</b>\n\n"
+        "✅ Under ₹5,000\n"
+        "✅ At least 50% below average\n\n"
+        "⚠️ Verify seller, variant and final checkout price."
+    )
+
+    telegram(
+        "sendMessage",
+        {
+            "chat_id": os.environ["TELEGRAM_CHAT_ID"],
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False,
+            "reply_markup": {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "🛒 BUY ON FLIPKART",
+                            "url": item["url"],
+                        }
+                    ]
+                ]
+            },
+        },
+    )
+
+
 def main():
+
     if not os.environ.get("TELEGRAM_BOT_TOKEN"):
-        raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
+        raise SystemExit(
+            "Missing TELEGRAM_BOT_TOKEN"
+        )
+
     if not os.environ.get("TELEGRAM_CHAT_ID"):
-        raise SystemExit("Missing TELEGRAM_CHAT_ID")
+        raise SystemExit(
+            "Missing TELEGRAM_CHAT_ID"
+        )
 
     state = load_state()
-    soup = fetch()
-    cards = extract_cards(soup)
 
-    qualified = []
-    for x in cards:
-        if x["current"] <= MAX_PRICE and x["current"] <= x["reference"] * DROP_RATIO:
-            qualified.append(x)
+    soup = get_soup(DEALS_URL)
 
+    deals = extract_deal_links(soup)
+
+    scanned = 0
+    qualified = 0
     sent = 0
-    now = int(time.time())
 
-    for item in qualified:
-        key = item["url"].split("?")[0]
-        old = state.get(key)
+    for deal in deals:
 
-        # Alert only when this deal hasn't been alerted recently at the same/lower price.
-        if old and old.get("price") <= item["current"] and now - old.get("time", 0) < 7 * 86400:
+        try:
+            item = extract_product(
+                deal["url"]
+            )
+
+        except Exception as error:
+            print(
+                f"ERROR reading {deal['url']}: {error}"
+            )
             continue
 
-        send_alert(item)
-        state[key] = {"price": item["current"], "time": now}
-        sent += 1
+        if not item:
+            continue
 
-    # Keep state bounded.
-    if len(state) > 3000:
-        state = dict(sorted(state.items(), key=lambda kv: kv[1].get("time", 0), reverse=True)[:2000])
+        scanned += 1
+
+        current = item["current"]
+        average = item["average"]
+
+        print(
+            f"{item['title']} | "
+            f"₹{current:,.0f} | "
+            f"30d avg ₹{average:,.0f}"
+        )
+
+        # YOUR EXACT DEAL RULE
+        if (
+            current <= MAX_PRICE
+            and current <= average * DROP_RATIO
+        ):
+            qualified += 1
+
+            key = item["url"].split("?")[0]
+
+            old = state.get(key)
+
+            now = int(time.time())
+
+            if (
+                old
+                and old.get("price") <= current
+                and now - old.get("time", 0)
+                < 7 * 86400
+            ):
+                continue
+
+            send_alert(item)
+
+            state[key] = {
+                "price": current,
+                "time": now,
+            }
+
+            sent += 1
+
+        # Small pause so we don't hammer the website.
+        time.sleep(0.5)
 
     save_state(state)
-    print(f"Scanned {len(cards)} cards; {len(qualified)} qualified; {sent} alerts sent.")
+
+    print(
+        f"Scanned {scanned} products; "
+        f"{qualified} qualified; "
+        f"{sent} alerts sent."
+    )
+
 
 if __name__ == "__main__":
     main()
