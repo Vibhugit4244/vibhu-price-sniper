@@ -9,119 +9,54 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-
-# ============================================================
-# SETTINGS
-# ============================================================
-
 MAX_PRICE = 5000
 MAX_AVERAGE_RATIO = 0.50
-
 TARGET_PRODUCTS = 1000
-
-# Product checking concurrency
 WORKERS = 10
-
 REQUEST_TIMEOUT = 12
 RETAILER_TIMEOUT = 10
-
-# Extremely cheap prices need extra validation.
-# We do NOT automatically reject cheap products because
-# genuine ₹49/₹99/₹199 products exist.
 SUSPICIOUS_PRICE = 100
-
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
 STATE_FILE = "state.json"
-
-
-# ============================================================
-# SOURCES
-# ============================================================
 
 SOURCE_PAGES = [
     "https://pricehistoryapp.com/deals",
     "https://pricehistoryapp.com/latest-deals",
     "https://pricehistoryapp.com/deals/store/flipkart",
     "https://pricehistoryapp.com/deals/store/myntra",
-
     "https://pricedropy.com/",
     "https://pricedropy.com/flipkart-price-history",
     "https://pricedropy.com/myntra-price-history",
-
     "https://pricehistorytracker.in/",
     "https://pricehistorytracker.in/latest-deals",
 ]
 
-
-# ============================================================
-# HTTP SESSION
-# ============================================================
-
-SESSION = requests.Session()
-
-SESSION.headers.update({
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 "
-        "(KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,"
-        "application/xml;q=0.9,*/*;q=0.8"
+        "AppleWebKit/537.36 Chrome/131 Safari/537.36"
     ),
     "Accept-Language": "en-IN,en;q=0.9",
-})
+}
 
 
 def fetch(url, timeout=REQUEST_TIMEOUT):
-
     try:
-        response = SESSION.get(
-            url,
-            timeout=timeout,
-            allow_redirects=True
-        )
-
-        if response.status_code != 200:
-            return None
-
-        return response.text
-
+        r = requests.get(url, headers=HEADERS, timeout=timeout)
+        if r.status_code == 200:
+            return r.text
     except Exception:
-        return None
+        pass
+    return ""
 
-
-# ============================================================
-# URL HELPERS
-# ============================================================
 
 def clean_url(url):
-
-    if not url:
-        return None
-
-    url = html.unescape(str(url)).strip()
-
-    if url.startswith("//"):
-        url = "https:" + url
-
-    if not url.startswith("http"):
-        return None
-
-    parsed = urlparse(url)
-
-    return parsed._replace(
-        query="",
-        fragment=""
-    ).geturl().rstrip("/")
+    return url.split("#")[0].split("?")[0].rstrip("/")
 
 
 def retailer(url):
-
     host = urlparse(url).netloc.lower()
 
     if "flipkart.com" in host:
@@ -130,257 +65,46 @@ def retailer(url):
     if "myntra.com" in host:
         return "Myntra"
 
-    return None
+    return ""
 
 
 def is_retailer_product(url):
-
-    store = retailer(url)
-
-    if not store:
-        return False
-
-    path = urlparse(url).path.lower()
-
-    if store == "Flipkart":
-        return (
-            "/p/" in path
-            or "/product/" in path
-            or "/item/" in path
-        )
-
-    if store == "Myntra":
-        return (
-            "/buy" in path
-            or "/product/" in path
-            or bool(re.search(r"-\d{5,}$", path))
-        )
-
-    return False
+    return retailer(url) != ""
 
 
 def is_tracker_page(url):
+    p = urlparse(url).path.lower()
 
-    host = urlparse(url).netloc.lower()
-    path = urlparse(url).path.lower()
+    return any(x in p for x in [
+        "/product/",
+        "/products/",
+        "/price-history/",
+        "/track/",
+        "/tracker/",
+        "/price-history"
+    ])
 
-    if "pricehistoryapp.com" in host:
-        return (
-            "/product/" in path
-            or "/price-history/" in path
-            or "/track/" in path
-        )
-
-    if "pricedropy.com" in host:
-        return (
-            "/product/" in path
-            or "/price-history/" in path
-            or "/track/" in path
-        )
-
-    if "pricehistorytracker.in" in host:
-        return (
-            "/product/" in path
-            or "/price-history/" in path
-            or "/track/" in path
-            or "/tracker/" in path
-        )
-
-    return False
-
-
-# ============================================================
-# MONEY
-# ============================================================
 
 def money(value):
-
     if value is None:
         return None
 
-    value = str(value)
+    value = str(value).replace(",", "").replace("₹", "").strip()
 
-    match = re.search(
-        r"(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d+)?)",
-        value,
-        re.I
-    )
+    m = re.search(r"(\d+(?:\.\d+)?)", value)
 
-    if not match:
+    if not m:
         return None
 
     try:
-        return float(
-            match.group(1).replace(",", "")
-        )
+        return float(m.group(1))
     except Exception:
         return None
 
 
-def price_from_string(value):
-
-    if value is None:
+def price_from_string(text):
+    if not text:
         return None
-
-    try:
-        number = float(
-            str(value)
-            .replace(",", "")
-            .replace("₹", "")
-            .strip()
-        )
-
-        if 0 < number <= 10000000:
-            return number
-
-    except Exception:
-        pass
-
-    return money(value)
-
-
-# ============================================================
-# JSON-LD
-# ============================================================
-
-def get_json_ld(soup):
-
-    objects = []
-
-    for script in soup.find_all(
-        "script",
-        attrs={"type": re.compile(r"ld\+json", re.I)}
-    ):
-
-        try:
-
-            data = json.loads(
-                script.string or script.get_text()
-            )
-
-            if isinstance(data, list):
-                objects.extend(data)
-            else:
-                objects.append(data)
-
-        except Exception:
-            pass
-
-    return objects
-
-
-# ============================================================
-# EXTRACT STRUCTURED CURRENT PRICE
-# ============================================================
-
-def structured_current_price(soup):
-
-    # --------------------------------------------------------
-    # JSON-LD Product / Offer
-    # --------------------------------------------------------
-
-    for obj in get_json_ld(soup):
-
-        if not isinstance(obj, dict):
-            continue
-
-        offers = obj.get("offers")
-
-        if isinstance(offers, dict):
-
-            for key in (
-                "price",
-                "lowPrice"
-            ):
-
-                if offers.get(key) is not None:
-
-                    value = price_from_string(
-                        offers.get(key)
-                    )
-
-                    if value:
-                        return value
-
-        elif isinstance(offers, list):
-
-            for offer in offers:
-
-                if not isinstance(offer, dict):
-                    continue
-
-                if offer.get("price") is not None:
-
-                    value = price_from_string(
-                        offer.get("price")
-                    )
-
-                    if value:
-                        return value
-
-    # --------------------------------------------------------
-    # Common meta price fields
-    # --------------------------------------------------------
-
-    meta_patterns = [
-        {
-            "property": "product:price:amount"
-        },
-        {
-            "property": "og:price:amount"
-        },
-        {
-            "name": "price"
-        },
-        {
-            "name": "product:price"
-        },
-    ]
-
-    for attrs in meta_patterns:
-
-        tag = soup.find(
-            "meta",
-            attrs=attrs
-        )
-
-        if tag and tag.get("content"):
-
-            value = price_from_string(
-                tag.get("content")
-            )
-
-            if value:
-                return value
-
-    # --------------------------------------------------------
-    # Itemprop price
-    # --------------------------------------------------------
-
-    tag = soup.find(
-        attrs={"itemprop": "price"}
-    )
-
-    if tag:
-
-        value = price_from_string(
-            tag.get("content")
-            or tag.get_text(" ", strip=True)
-        )
-
-        if value:
-            return value
-
-    return None
-
-
-# ============================================================
-# EXTRACT ALL CURRENCY PRICES
-# ============================================================
-
-def all_currency_prices(text):
-
-    prices = []
 
     patterns = [
         r"₹\s*([\d,]+(?:\.\d+)?)",
@@ -389,39 +113,117 @@ def all_currency_prices(text):
     ]
 
     for pattern in patterns:
+        m = re.search(pattern, text, re.I)
 
-        for value in re.findall(
-            pattern,
-            text,
-            re.I
-        ):
+        if m:
+            try:
+                return float(m.group(1).replace(",", ""))
+            except Exception:
+                pass
 
-            number = money(value)
+    return None
 
-            if number is not None:
-                prices.append(number)
+
+def get_json_ld(soup):
+    data = []
+
+    for script in soup.find_all(
+        "script",
+        type="application/ld+json"
+    ):
+        try:
+            obj = json.loads(script.string or script.get_text())
+
+            if isinstance(obj, list):
+                data.extend(obj)
+            else:
+                data.append(obj)
+
+        except Exception:
+            pass
+
+    return data
+
+
+def structured_current_price(soup):
+    for obj in get_json_ld(soup):
+
+        if not isinstance(obj, dict):
+            continue
+
+        offers = obj.get("offers")
+
+        if isinstance(offers, list):
+            offers = offers[0] if offers else None
+
+        if isinstance(offers, dict):
+            p = money(offers.get("price"))
+
+            if p:
+                return p
+
+        p = money(obj.get("price"))
+
+        if p:
+            return p
+
+    for tag in soup.find_all(
+        ["meta", "span", "div"],
+        attrs={
+            "itemprop": "price"
+        }
+    ):
+        p = money(
+            tag.get("content") or tag.get_text(" ", strip=True)
+        )
+
+        if p:
+            return p
+
+    return None
+
+
+def all_currency_prices(soup):
+    prices = []
+
+    for tag in soup.find_all(
+        ["meta", "span", "div", "p", "strong"]
+    ):
+        text = tag.get("content") or tag.get_text(
+            " ", strip=True
+        )
+
+        if "₹" not in text:
+            continue
+
+        p = price_from_string(text)
+
+        if p:
+            prices.append(p)
 
     return prices
 
 
-# ============================================================
-# TITLE
-# ============================================================
-
 def extract_title(soup):
+    for obj in get_json_ld(soup):
 
-    tag = soup.find(
+        if isinstance(obj, dict) and obj.get("name"):
+            return html.unescape(
+                str(obj["name"])
+            ).strip()
+
+    og = soup.find(
         "meta",
-        attrs={"property": "og:title"}
+        property="og:title"
     )
 
-    if tag and tag.get("content"):
-        return tag["content"].strip()
+    if og and og.get("content"):
+        return html.unescape(
+            og["content"]
+        ).strip()
 
-    tag = soup.find("title")
-
-    if tag:
-        return tag.get_text(
+    if soup.title:
+        return soup.title.get_text(
             " ",
             strip=True
         )
@@ -429,250 +231,126 @@ def extract_title(soup):
     return "Unknown product"
 
 
-# ============================================================
-# HISTORICAL AVERAGE
-# ============================================================
-
-def extract_average(soup, raw_html):
-
+def extract_average(soup):
     text = soup.get_text(
         " ",
         strip=True
     )
 
-    # More specific labels first.
-    labels = [
-        "30d average",
-        "30 day average",
-        "30-day average",
-        "90d average",
-        "90 day average",
-        "90-day average",
-        "historical average",
-        "average selling price",
-        "average price",
-        "typical selling price",
-        "typical price",
-    ]
-
-    for source in (text, raw_html):
-
-        lower = source.lower()
-
-        for label in labels:
-
-            pattern = (
-                re.escape(label)
-                + r".{0,100}?"
-                r"(?:₹|rs\.?|inr)?\s*"
-                r"([\d,]+(?:\.\d+)?)"
-            )
-
-            match = re.search(
-                pattern,
-                lower,
-                re.I
-            )
-
-            if match:
-
-                value = money(
-                    match.group(1)
-                )
-
-                if value and value > 0:
-                    return value
-
-    return None
-
-
-# ============================================================
-# FIND DIRECT RETAILER URL
-# ============================================================
-
-def find_buy_url(base_url, soup, raw_html):
-
-    # First inspect actual anchors.
-    for a in soup.find_all(
-        "a",
-        href=True
-    ):
-
-        href = a.get("href")
-
-        full = clean_url(
-            urljoin(base_url, href)
-        )
-
-        if full and is_retailer_product(full):
-            return full
-
-    # Then inspect raw HTML.
     patterns = [
-        r'https?://[^"\'>\s]+flipkart\.com[^"\'>\s]*',
-        r'https?://[^"\'>\s]+myntra\.com[^"\'>\s]*',
+        r"(?:30|90|180|365)[-\s]?day\s+average[^₹]*₹\s*([\d,]+(?:\.\d+)?)",
+        r"historical\s+average[^₹]*₹\s*([\d,]+(?:\.\d+)?)",
+        r"average\s+price[^₹]*₹\s*([\d,]+(?:\.\d+)?)",
+        r"average[^₹]*₹\s*([\d,]+(?:\.\d+)?)",
     ]
 
     for pattern in patterns:
-
-        for match in re.findall(
+        m = re.search(
             pattern,
-            raw_html,
+            text,
             re.I
-        ):
+        )
 
-            full = clean_url(match)
-
-            if full and is_retailer_product(full):
-                return full
+        if m:
+            try:
+                return float(
+                    m.group(1).replace(",", "")
+                )
+            except Exception:
+                pass
 
     return None
 
 
-# ============================================================
-# RETAILER PAGE PRICE EXTRACTION
-# ============================================================
+def find_buy_url(soup, base_url):
+    candidates = []
 
-def extract_retailer_price(soup):
+    for a in soup.find_all("a", href=True):
 
-    # 1. Structured data is the strongest signal.
-    value = structured_current_price(soup)
+        href = urljoin(
+            base_url,
+            a["href"]
+        )
 
-    if value is not None:
-        return value
+        if not is_retailer_product(href):
+            continue
 
-    # 2. Explicit itemprop.
-    itemprop = soup.find(
-        attrs={"itemprop": "price"}
+        candidates.append(href)
+
+        text = a.get_text(
+            " ",
+            strip=True
+        ).lower()
+
+        if any(x in text for x in [
+            "buy",
+            "shop",
+            "view",
+            "flipkart",
+            "myntra"
+        ]):
+            return href
+
+    return candidates[0] if candidates else ""
+
+
+def extract_retailer_price(url):
+    page = fetch(
+        url,
+        timeout=RETAILER_TIMEOUT
     )
 
-    if itemprop:
+    if not page:
+        return None
 
-        value = price_from_string(
-            itemprop.get("content")
-            or itemprop.get_text(" ", strip=True)
-        )
+    soup = BeautifulSoup(
+        page,
+        "html.parser"
+    )
 
-        if value:
-            return value
+    p = structured_current_price(soup)
 
-    # 3. Meta fields.
-    for attrs in [
-        {"property": "product:price:amount"},
-        {"property": "og:price:amount"},
-    ]:
-
-        tag = soup.find(
-            "meta",
-            attrs=attrs
-        )
-
-        if tag:
-
-            value = price_from_string(
-                tag.get("content")
-            )
-
-            if value:
-                return value
+    if p and p > 0:
+        return p
 
     return None
 
-
-# ============================================================
-# IMPORTANT PRICE VALIDATION
-# ============================================================
 
 def validate_current_price(
     tracker_price,
     retailer_price,
-    average,
-    title
+    average
 ):
+    if not tracker_price:
+        return None
 
-    if tracker_price is None:
-        return None, "No tracker current price"
+    if retailer_price:
 
-    if tracker_price <= 0:
-        return None, "Invalid tracker price"
-
-    if average is None or average <= 0:
-        return None, "No historical average"
-
-    # --------------------------------------------------------
-    # Basic sanity.
-    # --------------------------------------------------------
-
-    if tracker_price > MAX_PRICE:
-        return tracker_price, "Above price limit"
-
-    # --------------------------------------------------------
-    # If the actual retailer page gives us a price,
-    # prefer that over an ambiguous tracker number.
-    # --------------------------------------------------------
-
-    if retailer_price is not None:
-
-        # If both agree closely, excellent.
         difference = abs(
-            retailer_price - tracker_price
-        ) / max(retailer_price, 1)
-
-        if difference <= 0.15:
-            return retailer_price, "Retailer + tracker agree"
-
-        # If tracker says something absurdly cheap,
-        # but retailer says ₹1,000+, DO NOT use tracker price.
-        if tracker_price < SUSPICIOUS_PRICE:
-
-            return None, (
-                "Rejected suspicious tracker price: "
-                f"₹{tracker_price:.0f} vs retailer "
-                f"₹{retailer_price:.0f}"
-            )
-
-        # If tracker and retailer disagree substantially,
-        # use retailer price as the safer current price.
-        return retailer_price, "Retailer price used"
-
-    # --------------------------------------------------------
-    # NO RETAILER PRICE AVAILABLE
-    # --------------------------------------------------------
-
-    # Very low prices require independent confirmation.
-    # This specifically prevents false ₹25 / ₹49 / ₹99 alerts.
-    if tracker_price < SUSPICIOUS_PRICE:
-
-        return None, (
-            "Rejected suspiciously low price "
-            f"₹{tracker_price:.0f} without retailer confirmation"
+            tracker_price - retailer_price
+        ) / max(
+            tracker_price,
+            retailer_price
         )
 
-    # --------------------------------------------------------
-    # Historical-average sanity check.
-    #
-    # If a price is 99% below history, demand stronger
-    # validation. We don't want parser errors becoming alerts.
-    # --------------------------------------------------------
+        if difference <= 0.15:
+            return retailer_price
 
-    ratio = tracker_price / average
+        return retailer_price
 
-    if ratio < 0.05:
+    if tracker_price < SUSPICIOUS_PRICE:
+        return None
 
-        if retailer_price is None:
-            return None, (
-                "Rejected extreme price/history ratio"
-            )
+    if (
+        average
+        and tracker_price / average < 0.05
+    ):
+        return None
 
-    return tracker_price, "Validated"
+    return tracker_price
 
-
-# ============================================================
-# PARSE TRACKER PRODUCT
-# ============================================================
 
 def parse_tracker(url):
-
     page = fetch(url)
 
     if not page:
@@ -684,219 +362,75 @@ def parse_tracker(url):
     )
 
     title = extract_title(soup)
-
-    store = None
-
+    average = extract_average(soup)
+    tracker_price = structured_current_price(soup)
     buy_url = find_buy_url(
-        url,
         soup,
-        page
+        url
     )
 
-    if buy_url:
-        store = retailer(buy_url)
-
-    # --------------------------------------------------------
-    # Tracker current price
-    # --------------------------------------------------------
-
-    tracker_current = structured_current_price(
-        soup
-    )
-
-    # --------------------------------------------------------
-    # Historical average
-    # --------------------------------------------------------
-
-    average = extract_average(
-        soup,
-        page
-    )
-
-    # --------------------------------------------------------
-    # If structured current price wasn't available,
-    # look for explicitly labelled current price.
-    # --------------------------------------------------------
-
-    if tracker_current is None:
-
-        text = soup.get_text(
-            " ",
-            strip=True
-        )
-
-        labels = [
-            "current price",
-            "current",
-            "selling price",
-            "sale price",
-            "today's price",
-            "price today",
-            "live price",
-        ]
-
-        lower = text.lower()
-
-        for label in labels:
-
-            pattern = (
-                re.escape(label)
-                + r".{0,100}?"
-                r"(?:₹|rs\.?|inr)?\s*"
-                r"([\d,]+(?:\.\d+)?)"
-            )
-
-            match = re.search(
-                pattern,
-                lower,
-                re.I
-            )
-
-            if match:
-
-                value = money(
-                    match.group(1)
-                )
-
-                if value:
-                    tracker_current = value
-                    break
-
-    if tracker_current is None:
+    if not buy_url:
         return None
 
-    if average is None:
+    store = retailer(buy_url)
+
+    if store not in [
+        "Flipkart",
+        "Myntra"
+    ]:
         return None
 
-    # --------------------------------------------------------
-    # Retailer cross-check
-    # --------------------------------------------------------
-
-    retailer_current = None
-
-    if buy_url:
-
-        retailer_html = fetch(
-            buy_url,
-            timeout=RETAILER_TIMEOUT
-        )
-
-        if retailer_html:
-
-            retailer_soup = BeautifulSoup(
-                retailer_html,
-                "html.parser"
-            )
-
-            retailer_current = (
-                extract_retailer_price(
-                    retailer_soup
-                )
-            )
-
-    # --------------------------------------------------------
-    # Validate current price.
-    # --------------------------------------------------------
-
-    validated_price, reason = validate_current_price(
-        tracker_current,
-        retailer_current,
-        average,
-        title
+    retailer_price = extract_retailer_price(
+        buy_url
     )
 
-    if validated_price is None:
-
-        print(
-            f"REJECTED: {title[:60]} | "
-            f"{reason}"
-        )
-
-        return None
-
-    # --------------------------------------------------------
-    # Store must be Flipkart or Myntra.
-    # --------------------------------------------------------
-
-    if store not in ("Flipkart", "Myntra"):
-
-        return None
-
-    # --------------------------------------------------------
-    # Final deal rule.
-    # --------------------------------------------------------
-
-    qualifies = (
-        validated_price <= MAX_PRICE
-        and validated_price <= (
-            average * MAX_AVERAGE_RATIO
-        )
+    current = validate_current_price(
+        tracker_price,
+        retailer_price,
+        average
     )
 
-    if qualifies:
+    if not current or not average:
+        return None
 
-        print(
-            f"QUALIFIED: {title[:60]} | "
-            f"{store} | "
-            f"₹{validated_price:.0f} | "
-            f"avg ₹{average:.0f}"
-        )
+    if current <= 0 or average <= 0:
+        return None
 
     return {
         "title": title,
-        "current": validated_price,
-        "tracker_current": tracker_current,
-        "retailer_current": retailer_current,
-        "average": average,
         "store": store,
-        "tracker_url": url,
+        "current": current,
+        "average": average,
         "buy_url": buy_url,
-        "qualifies": qualifies,
     }
 
 
-# ============================================================
-# DISCOVERY
-# ============================================================
-
-def extract_links(base_url, page):
-
+def extract_links(page, base_url):
     soup = BeautifulSoup(
         page,
         "html.parser"
     )
 
-    found = set()
+    links = set()
 
     for a in soup.find_all(
         "a",
         href=True
     ):
-
-        full = clean_url(
-            urljoin(
-                base_url,
-                a.get("href")
-            )
+        href = urljoin(
+            base_url,
+            a["href"]
         )
 
-        if not full:
-            continue
+        if is_tracker_page(href):
+            links.add(clean_url(href))
 
-        if (
-            is_tracker_page(full)
-            or is_retailer_product(full)
-        ):
-
-            found.add(full)
-
-    return found
+    return list(links)
 
 
 def discover():
-
-    tracker_pages = set()
-    retailer_pages = set()
+    products = []
+    seen = set()
 
     print()
     print("==========================================")
@@ -908,96 +442,156 @@ def discover():
         print()
         print("Source:", source)
 
-                page = fetch(
+        page = fetch(
             source,
             timeout=REQUEST_TIMEOUT
         )
 
         if not page:
-            print("  Could not fetch source")
+            print("  Fetch failed")
             continue
 
-        links = extract_links(page, source)
+        links = extract_links(
+            page,
+            source
+        )
 
-        print("  Product links found:", len(links))
+        new = 0
 
         for link in links:
-            if len(products) >= TARGET_PRODUCTS:
-                break
-
-            link = clean_url(link)
 
             if link in seen:
                 continue
 
-            if not is_tracker_page(link):
-                continue
-
             seen.add(link)
             products.append(link)
+            new += 1
 
-        print("  Total discovered:", len(products))
+            if len(products) >= TARGET_PRODUCTS:
+                break
+
+        print(
+            "  New:",
+            new,
+            "Total:",
+            len(products)
+        )
 
         if len(products) >= TARGET_PRODUCTS:
             break
+
+    return products
+
+
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram secrets missing")
+        return False
+
+    url = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_BOT_TOKEN
+        + "/sendMessage"
+    )
+
+    try:
+        r = requests.post(
+            url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": False,
+            },
+            timeout=15
+        )
+
+        return r.ok
+
+    except Exception as e:
+        print("Telegram error:", e)
+        return False
+
+
+def load_state():
+    try:
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+            return json.load(f)
+
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    with open(
+        STATE_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            state,
+            f,
+            indent=2
+        )
+
+
+def main():
+
+    products = discover()
 
     print()
     print("==========================================")
     print("PRODUCT CHECK")
     print("==========================================")
 
-    print("Products discovered:", len(products))
+    print(
+        "Products discovered:",
+        len(products)
+    )
 
     results = []
 
-    with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+    with ThreadPoolExecutor(
+        max_workers=WORKERS
+    ) as executor:
 
         futures = {
-            executor.submit(parse_tracker, url): url
+            executor.submit(
+                parse_tracker,
+                url
+            ): url
             for url in products
         }
 
-        completed = 0
-
-        for future in as_completed(futures):
-
-            url = futures[future]
-            completed += 1
+        for i, future in enumerate(
+            as_completed(futures),
+            1
+        ):
 
             try:
                 result = future.result()
 
                 if result:
+
                     results.append(result)
 
                     print(
-                        f"[{completed}/{len(products)}] "
-                        f"{result.get('title', 'Unknown')[:70]} "
-                        f"| ₹{result.get('current', 0):,.0f} "
-                        f"| avg ₹{result.get('average', 0):,.0f} "
-                        f"| {result.get('store', 'Unknown')}"
-                    )
-
-                else:
-                    print(
-                        f"[{completed}/{len(products)}] "
-                        f"Rejected / invalid: {url}"
+                        f"[{i}/{len(products)}] "
+                        f"{result['store']} | "
+                        f"{result['title'][:55]} | "
+                        f"₹{result['current']:,.0f} | "
+                        f"avg ₹{result['average']:,.0f}"
                     )
 
             except Exception as e:
 
                 print(
-                    f"[{completed}/{len(products)}] "
-                    f"ERROR: {url} -> {e}"
+                    f"[{i}/{len(products)}] Error:",
+                    e
                 )
-
-    print()
-    print("==========================================")
-    print("RESULTS")
-    print("==========================================")
-
-    print("Products checked:", len(products))
-    print("Valid products:", len(results))
 
     qualified = []
 
@@ -1006,52 +600,40 @@ def discover():
         current = item["current"]
         average = item["average"]
 
-        if current <= MAX_PRICE and average > 0:
+        if (
+            current <= MAX_PRICE
+            and average > 0
+            and current / average <= MAX_AVERAGE_RATIO
+        ):
 
-            ratio = current / average
+            item["discount_from_average"] = (
+                1 - current / average
+            ) * 100
 
-            if ratio <= MAX_AVERAGE_RATIO:
-
-                item["discount_from_average"] = (
-                    (1 - ratio) * 100
-                )
-
-                qualified.append(item)
-
-    print("Products qualified:", len(qualified))
-
-    if not qualified:
-        print()
-        print("No products passed the final deal rule.")
-        print()
-        return
+            qualified.append(item)
 
     print()
     print("==========================================")
-    print("QUALIFIED DEALS")
+    print("RESULTS")
     print("==========================================")
 
-    for item in qualified:
+    print(
+        "Products checked:",
+        len(products)
+    )
 
-        print()
-        print("Product:", item["title"])
-        print("Store:", item["store"])
-        print("Current:", f"₹{item['current']:,.0f}")
-        print("Average:", f"₹{item['average']:,.0f}")
-        print(
-            "Below average:",
-            f"{item['discount_from_average']:.1f}%"
-        )
-        print("Buy:", item["buy_url"])
+    print(
+        "Valid products:",
+        len(results)
+    )
 
-    print()
-    print("==========================================")
-    print("TELEGRAM")
-    print("==========================================")
+    print(
+        "Qualified deals:",
+        len(qualified)
+    )
 
     state = load_state()
-
-    alerts_sent = 0
+    sent = 0
 
     for item in qualified:
 
@@ -1062,45 +644,38 @@ def discover():
         )
 
         if key in state:
-            print("Already alerted:", item["title"][:60])
             continue
 
         message = (
             "🔥 VERIFIED PRICE DEAL\n\n"
             f"🛍️ {item['title']}\n\n"
             f"🏪 Store: {item['store']}\n"
-            f"💰 Current price: ₹{item['current']:,.0f}\n"
-            f"📊 Historical average: ₹{item['average']:,.0f}\n"
+            f"💰 Current: ₹{item['current']:,.0f}\n"
+            f"📊 Historical average: "
+            f"₹{item['average']:,.0f}\n"
             f"📉 Below average: "
             f"{item['discount_from_average']:.1f}%\n\n"
             "✅ Current price validated\n"
-            "✅ Meets ₹5,000 limit\n"
-            "✅ Below 50% of historical average\n\n"
-            f"🛒 BUY NOW:\n{item['buy_url']}"
+            "✅ ≤ ₹5,000\n"
+            "✅ ≤ 50% of historical average\n\n"
+            f"🛒 BUY NOW:\n"
+            f"{item['buy_url']}"
         )
 
         if send_telegram(message):
 
             state[key] = {
                 "title": item["title"],
-                "store": item["store"],
                 "current": item["current"],
                 "average": item["average"],
                 "sent_at": int(time.time())
             }
 
-            alerts_sent += 1
+            sent += 1
 
             print(
                 "Alert sent:",
-                item["title"][:70]
-            )
-
-        else:
-
-            print(
-                "Telegram failed:",
-                item["title"][:70]
+                item["title"][:60]
             )
 
     save_state(state)
@@ -1110,7 +685,10 @@ def discover():
     print("DONE")
     print("==========================================")
 
-    print("Alerts sent:", alerts_sent)
+    print(
+        "Alerts sent:",
+        sent
+    )
 
 
 if __name__ == "__main__":
