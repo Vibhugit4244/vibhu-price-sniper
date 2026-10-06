@@ -262,5 +262,35 @@
     "current": 431.0,
     "average": 971.0,
     "sent_at": 1791316906
+  },
+  "Myntra|https://www.myntra.com/shampoo-and-conditioner/head--shoulders/head--shoulders-cool-menthol-2-in-1-anti-dandruff-shampoo--conditioner---1-litre/13277564/buy": {
+    "title": "Head & Shoulders Cool Menthol 2-In-1 Anti Dandruff Shampoo + Conditioner - 1 Litre",
+    "current": 206.0,
+    "average": 731.0,
+    "sent_at": 1791318369
+  },
+  "Flipkart|https://www.flipkart.com/lee-cooper-lc07319-060-chronograph-analog-watch-men/p/itm1b8583a1a8838?pid=WATGHYWEKU6G4JWM&lid=LSTWATGHYWEKU6G4JWMJRX0WQ": {
+    "title": "LEE COOPER LC07319.060 Analog Watch  - For Men",
+    "current": 3899.0,
+    "average": 20536.0,
+    "sent_at": 1791318369
+  },
+  "Flipkart|https://www.flipkart.com/lee-cooper-analog-watch-men/p/itm0eaeafd421a16?pid=WATHDP2ZCYYVCNCM&lid=LSTWATHDP2ZCYYVCNCME0NNLX": {
+    "title": "Analog Watch - For Men LC08188.270",
+    "current": 4089.0,
+    "average": 16348.0,
+    "sent_at": 1791318370
+  },
+  "Myntra|https://www.myntra.com/perfume/jean+paul+gaultier/jean-paul-gaultier-men-le-male-eau-de-parfum---125-ml/14184030/buy": {
+    "title": "Jean Paul Gaultier Men Le Male Eau de Parfum - 125 ml",
+    "current": 2350.0,
+    "average": 9088.0,
+    "sent_at": 1791318370
+  },
+  "Flipkart|https://www.flipkart.com/lee-cooper-analog-watch-men/p/itm6a5fabc452f7c?pid=WATHDP2SXGJQXNYN&lid=LSTWATHDP2SXGJQXNYNCQFFGD": {
+    "title": "LEE COOPER Analog Watch - For Men",
+    "current": 3839.0,
+    "average": 13082.0,
+    "sent_at": 1791318371
   }
 }
