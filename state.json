@@ -166,5 +166,17 @@
     "current": 1182.0,
     "average": 8434.0,
     "sent_at": 1791302650
+  },
+  "Myntra|https://www.myntra.com/Perfume-and-Body-Mist/SKINN/SKINN-by-Titan-Women-Sheer-EDP--100-ML/11785256/buy": {
+    "title": "SKINN by Titan Women Sheer Eau de Parfum 100 ml",
+    "current": 556.0,
+    "average": 2349.0,
+    "sent_at": 1791304081
+  },
+  "Flipkart|https://www.flipkart.com/safari-eclipse-neo-75-4w-rose-gold-check-in-suitcase-8-wheels-30-inches/p/itme65468615cd61?pid=STCHHFRWHSG99QEN&lid=LSTSTCHHFRWHSG99QENY43GM6": {
+    "title": "Large Check-in Suitcase (75 cm) 8 Wheels - ECLIPSE NEO 75 4W ROSE GOLD - Pink",
+    "current": 1994.0,
+    "average": 9137.0,
+    "sent_at": 1791304082
   }
 }
