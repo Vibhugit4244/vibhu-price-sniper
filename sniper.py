@@ -3,7 +3,7 @@ import os
 import re
 import time
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,11 +16,18 @@ from bs4 import BeautifulSoup
 MAX_PRICE = 5000.0
 DROP_RATIO = 0.50
 
-MAX_PRODUCT_PAGES = 150
-REQUEST_DELAY = 0.5
+# TARGET: at least 1,000 product pages per run
+TARGET_PRODUCTS = 1000
+
+# Discover more than we need so failed/duplicate pages
+# do not reduce the final scan below the target.
+DISCOVERY_TARGET = 3000
+
+REQUEST_DELAY = 0.20
 TIMEOUT = 20
 
 STATE_FILE = Path("state.json")
+
 
 HEADERS = {
     "User-Agent": (
@@ -30,11 +37,15 @@ HEADERS = {
         "Chrome/140.0 Safari/537.36"
     ),
     "Accept-Language": "en-IN,en;q=0.9",
+    "Accept": (
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,*/*;q=0.8"
+    ),
 }
 
 
 # ============================================================
-# PRICE HISTORY SOURCES
+# SOURCES
 # ============================================================
 
 SOURCE_PAGES = [
@@ -43,55 +54,61 @@ SOURCE_PAGES = [
         "https://pricehistoryapp.com/deals",
     ),
     (
+        "PriceHistoryApp",
+        "https://pricehistoryapp.com/latest-deals",
+    ),
+    (
+        "PriceHistoryApp",
+        "https://pricehistoryapp.com/deals/store/flipkart",
+    ),
+    (
+        "PriceHistoryApp",
+        "https://pricehistoryapp.com/deals/store/myntra",
+    ),
+    (
         "PriceDropy",
         "https://pricedropy.com/",
     ),
     (
-        "PriceDiff",
-        "https://pricediff.in/top-deals/",
+        "PriceDropy",
+        "https://pricedropy.com/flipkart-price-history",
+    ),
+    (
+        "PriceDropy",
+        "https://pricedropy.com/myntra-price-history",
     ),
     (
         "PriceTrail",
         "https://pricehistorytracker.in/",
     ),
+    (
+        "PriceTrail",
+        "https://pricehistorytracker.in/latest-deals",
+    ),
 ]
 
 
-ALLOWED_STORES = {
-    "flipkart": "Flipkart",
-    "myntra": "Myntra",
-}
+# Pages to try.
+# Not every source necessarily has every page.
+PAGE_PATTERNS = [
+    "?page={}",
+    "?page={}&store=flipkart",
+    "?page={}&store=myntra",
+    "/page/{}",
+]
 
+
+# ============================================================
+# SESSION
+# ============================================================
 
 session = requests.Session()
 session.headers.update(HEADERS)
 
 
 # ============================================================
-# BASIC HELPERS
+# STATE
 # ============================================================
-
-def money(text):
-    if not text:
-        return None
-
-    match = re.search(
-        r"(?:₹|Rs\.?|INR)\s*"
-        r"([0-9][0-9,]*(?:\.[0-9]+)?)",
-        text,
-        re.IGNORECASE,
-    )
-
-    if not match:
-        return None
-
-    try:
-        return float(
-            match.group(1).replace(",", "")
-        )
-    except ValueError:
-        return None
-
 
 def load_state():
     if not STATE_FILE.exists():
@@ -118,6 +135,10 @@ def save_state(state):
     )
 
 
+# ============================================================
+# HTTP
+# ============================================================
+
 def get_soup(url):
     response = session.get(
         url,
@@ -133,25 +154,86 @@ def get_soup(url):
     )
 
 
+# ============================================================
+# STORE DETECTION
+# ============================================================
+
 def normalise_store(text):
     text = (text or "").lower()
 
-    for key, name in ALLOWED_STORES.items():
-        if key in text:
-            return name
+    if "flipkart" in text:
+        return "Flipkart"
+
+    if "myntra" in text:
+        return "Myntra"
 
     return None
 
 
 # ============================================================
-# LINK DISCOVERY
+# URL CLEANING
 # ============================================================
 
-def product_links_from_page(
+def clean_url(url):
+    parsed = urlparse(url)
+
+    # Remove query and fragment so the same product
+    # doesn't appear repeatedly with tracking parameters.
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path.rstrip("/"),
+            "",
+            "",
+            "",
+        )
+    )
+
+
+# ============================================================
+# PRODUCT LINK DETECTION
+# ============================================================
+
+def looks_like_product_url(url):
+    path = urlparse(url).path.lower()
+
+    product_words = [
+        "/product/",
+        "/products/",
+        "/item/",
+        "/price-history/",
+        "/pricehistory/",
+        "/track/",
+        "/tracker/",
+    ]
+
+    return any(
+        word in path
+        for word in product_words
+    )
+
+
+def is_tracker_domain(url):
+    host = urlparse(url).netloc.lower()
+
+    domains = [
+        "pricehistoryapp.com",
+        "pricedropy.com",
+        "pricehistorytracker.in",
+    ]
+
+    return any(
+        domain in host
+        for domain in domains
+    )
+
+
+def extract_product_links(
     soup,
     base_url,
 ):
-    found = []
+    results = []
     seen = set()
 
     for link in soup.find_all(
@@ -163,41 +245,15 @@ def product_links_from_page(
             link["href"],
         )
 
-        parsed = urlparse(href)
+        if not is_tracker_domain(href):
+            continue
 
-        if parsed.scheme not in (
-            "http",
-            "https",
+        if not looks_like_product_url(
+            href
         ):
             continue
 
-        host = parsed.netloc.lower()
-        path = parsed.path.lower()
-
-        allowed_domain = any(
-            domain in host
-            for domain in (
-                "pricehistoryapp.com",
-                "pricedropy.com",
-                "pricediff.in",
-                "pricehistorytracker.in",
-            )
-        )
-
-        if not allowed_domain:
-            continue
-
-        # Accept common product URL formats.
-        looks_like_product = (
-            "/product/" in path
-            or "/products/" in path
-            or "/item/" in path
-            or "price-history" in path
-            or "pricehistory" in path
-        )
-
-        if not looks_like_product:
-            continue
+        href = clean_url(href)
 
         if href in seen:
             continue
@@ -205,247 +261,446 @@ def product_links_from_page(
         text = " ".join(
             link.stripped_strings
         )
-
-        if not text:
-            continue
 
         store = normalise_store(
             text
         )
 
         if store is None:
-            # Sometimes store name is in
-            # the URL or nearby page data.
             store = normalise_store(
                 href
             )
 
-        if store is None:
+        if store not in (
+            "Flipkart",
+            "Myntra",
+        ):
             continue
 
         seen.add(href)
 
-        found.append(
-            (
-                href,
-                text,
-                store,
+        results.append(
+            {
+                "tracker_url": href,
+                "store": store,
+                "anchor_text": text,
+            }
+        )
+
+    return results
+
+
+# ============================================================
+# DISCOVER PAGINATION LINKS
+# ============================================================
+
+def extract_pagination_links(
+    soup,
+    base_url,
+):
+    links = []
+    seen = set()
+
+    for link in soup.find_all(
+        "a",
+        href=True,
+    ):
+        href = urljoin(
+            base_url,
+            link["href"],
+        )
+
+        if not is_tracker_domain(href):
+            continue
+
+        text = " ".join(
+            link.stripped_strings
+        ).lower()
+
+        href_lower = href.lower()
+
+        is_pagination = (
+            "page=" in href_lower
+            or "/page/" in href_lower
+            or text in (
+                "next",
+                "next page",
+                "older",
+                ">",
+                "»",
             )
         )
 
-    return found
+        if not is_pagination:
+            continue
 
-
-def discover_candidates(
-    source_name,
-    start_url,
-    max_candidates=100,
-):
-    candidates = []
-    seen = set()
-
-    try:
-        soup = get_soup(start_url)
-    except Exception as error:
-        print(
-            f"[{source_name}] "
-            f"Could not open source: {error}"
-        )
-        return candidates
-
-    links = product_links_from_page(
-        soup,
-        start_url,
-    )
-
-    for (
-        href,
-        anchor_text,
-        store,
-    ) in links:
+        href = clean_url(href)
 
         if href in seen:
             continue
 
         seen.add(href)
+        links.append(href)
 
-        candidates.append(
-            {
-                "source": source_name,
-                "tracker_url": href,
-                "anchor_text": anchor_text,
-                "store": store,
-            }
+    return links
+
+
+# ============================================================
+# DISCOVER ONE PAGE
+# ============================================================
+
+def discover_page(
+    source_name,
+    url,
+):
+    try:
+        soup = get_soup(url)
+
+    except Exception as error:
+        print(
+            f"[{source_name}] "
+            f"FAILED: {url} -> {error}"
         )
 
-        if len(candidates) >= max_candidates:
-            break
+        return [], []
 
-    return candidates
+    products = extract_product_links(
+        soup,
+        url,
+    )
+
+    pagination = extract_pagination_links(
+        soup,
+        url,
+    )
+
+    return products, pagination
 
 
 # ============================================================
-# DIRECT BUY LINK
+# MASS DISCOVERY
 # ============================================================
 
-def extract_store_buy_link(
-    soup,
-    store,
-):
-    wanted = store.lower()
+def discover_products():
+    queue = []
+    queued = set()
 
-    # First look for obvious BUY buttons.
-    for link in soup.find_all(
-        "a",
-        href=True,
-    ):
-        text = " ".join(
-            link.stripped_strings
-        ).lower()
+    for (
+        source_name,
+        url,
+    ) in SOURCE_PAGES:
 
-        href = link["href"]
+        queue.append(
+            (
+                source_name,
+                url,
+            )
+        )
 
-        if wanted not in text:
+        queued.add(url)
+
+    discovered = {}
+    processed_pages = set()
+
+    print("")
+    print(
+        "========================================"
+    )
+    print(
+        "STARTING HIGH-COVERAGE DISCOVERY"
+    )
+    print(
+        "Target products: "
+        f"{TARGET_PRODUCTS}"
+    )
+    print(
+        "Discovery target: "
+        f"{DISCOVERY_TARGET}"
+    )
+    print(
+        "========================================"
+    )
+
+    while queue and len(discovered) < DISCOVERY_TARGET:
+
+        source_name, url = queue.pop(0)
+
+        if url in processed_pages:
             continue
 
-        if store == "Flipkart":
-            if "flipkart.com" in href.lower():
-                return href
+        processed_pages.add(url)
 
-        elif store == "Myntra":
-            if "myntra.com" in href.lower():
-                return href
+        products, pagination = discover_page(
+            source_name,
+            url,
+        )
 
-    # Second attempt: any direct retailer URL.
-    for link in soup.find_all(
-        "a",
-        href=True,
-    ):
-        href = link["href"]
+        for product in products:
 
-        if store == "Flipkart":
-            if "flipkart.com" in href.lower():
-                return href
+            product_url = product[
+                "tracker_url"
+            ]
 
-        elif store == "Myntra":
-            if "myntra.com" in href.lower():
-                return href
+            if product_url not in discovered:
+                discovered[
+                    product_url
+                ] = product
 
-    return None
+        print(
+            f"[DISCOVERY] "
+            f"{source_name} | "
+            f"products={len(products)} | "
+            f"total={len(discovered)} | "
+            f"pages={len(processed_pages)}"
+        )
+
+        # Follow discovered pagination.
+        for next_url in pagination:
+
+            if next_url not in queued:
+                queued.add(next_url)
+
+                queue.append(
+                    (
+                        source_name,
+                        next_url,
+                    )
+                )
+
+        # If a site doesn't expose pagination links,
+        # try conventional page-number URLs.
+        if len(discovered) < DISCOVERY_TARGET:
+
+            for page_number in range(
+                2,
+                51,
+            ):
+
+                for pattern in PAGE_PATTERNS:
+
+                    candidate = (
+                        url.rstrip("/")
+                        + pattern.format(
+                            page_number
+                        )
+                    )
+
+                    if candidate not in queued:
+                        queued.add(candidate)
+
+                        queue.append(
+                            (
+                                source_name,
+                                candidate,
+                            )
+                        )
+
+                # Don't flood queue unnecessarily.
+                if len(queue) > 150:
+                    break
+
+        time.sleep(
+            REQUEST_DELAY
+        )
+
+    products = list(
+        discovered.values()
+    )
+
+    print("")
+    print(
+        "DISCOVERY FINISHED"
+    )
+    print(
+        f"Pages visited: "
+        f"{len(processed_pages)}"
+    )
+    print(
+        f"Unique products discovered: "
+        f"{len(products)}"
+    )
+
+    return products
 
 
 # ============================================================
 # PRICE PARSING
 # ============================================================
 
-def find_current_price(page_text):
+def find_current_price(text):
+
     patterns = [
-        r"Current\s*Price\s*:?\s*(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
-        r"Current\s*:?\s*(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
-        r"Current price\s*:?\s*(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+        r"Current\s*Price\s*:?\s*"
+        r"(?:₹|Rs\.?|INR)\s*"
+        r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+
+        r"Current\s*:?\s*"
+        r"(?:₹|Rs\.?|INR)\s*"
+        r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+
+        r"Current price\s*:?\s*"
+        r"(?:₹|Rs\.?|INR)\s*"
+        r"([0-9][0-9,]*(?:\.[0-9]+)?)",
     ]
 
     for pattern in patterns:
+
         match = re.search(
             pattern,
-            page_text,
+            text,
             re.IGNORECASE,
         )
 
         if match:
             return float(
-                match.group(1).replace(",", "")
+                match.group(1)
+                .replace(",", "")
             )
 
     return None
 
 
-def find_average(page_text):
-    # Prefer 30-day average.
-    patterns_30 = [
-        r"30d\s*Average\s*:?\s*(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
-        r"30-day\s*average\s*:?\s*(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
-        r"30\s*day\s*average\s*:?\s*(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
-    ]
+def find_average(text):
 
-    for pattern in patterns_30:
-        match = re.search(
-            pattern,
-            page_text,
-            re.IGNORECASE,
-        )
-
-        if match:
-            return (
-                float(
-                    match.group(1).replace(",", "")
-                ),
-                30,
-            )
-
-    # Then 90-day average.
-    patterns_90 = [
-        r"90d\s*Average\s*:?\s*(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
-        r"90-day\s*average\s*:?\s*(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
-        r"90\s*day\s*average\s*:?\s*(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
-    ]
-
-    for pattern in patterns_90:
-        match = re.search(
-            pattern,
-            page_text,
-            re.IGNORECASE,
-        )
-
-        if match:
-            return (
-                float(
-                    match.group(1).replace(",", "")
-                ),
-                90,
-            )
-
-    # Final fallback.
-    pattern = (
-        r"Average\s*price\s*:?\s*"
-        r"(?:₹|Rs\.?|INR)\s*"
-        r"([0-9][0-9,]*(?:\.[0-9]+)?)"
-    )
-
-    match = re.search(
-        pattern,
-        page_text,
-        re.IGNORECASE,
-    )
-
-    if match:
-        return (
-            float(
-                match.group(1).replace(",", "")
-            ),
+    patterns = [
+        (
+            30,
+            r"30d\s*Average\s*:?\s*"
+            r"(?:₹|Rs\.?|INR)\s*"
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+        ),
+        (
+            30,
+            r"30-day\s*average\s*:?\s*"
+            r"(?:₹|Rs\.?|INR)\s*"
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+        ),
+        (
+            30,
+            r"30\s*day\s*average\s*:?\s*"
+            r"(?:₹|Rs\.?|INR)\s*"
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+        ),
+        (
+            90,
+            r"90d\s*Average\s*:?\s*"
+            r"(?:₹|Rs\.?|INR)\s*"
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+        ),
+        (
+            90,
+            r"90-day\s*average\s*:?\s*"
+            r"(?:₹|Rs\.?|INR)\s*"
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+        ),
+        (
+            90,
+            r"90\s*day\s*average\s*:?\s*"
+            r"(?:₹|Rs\.?|INR)\s*"
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+        ),
+        (
             0,
+            r"Average\s*price\s*:?\s*"
+            r"(?:₹|Rs\.?|INR)\s*"
+            r"([0-9][0-9,]*(?:\.[0-9]+)?)",
+        ),
+    ]
+
+    for days, pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE,
         )
+
+        if match:
+            return (
+                float(
+                    match.group(1)
+                    .replace(",", "")
+                ),
+                days,
+            )
 
     return None, None
 
 
 # ============================================================
-# READ PRODUCT PAGE
+# DIRECT STORE LINK
 # ============================================================
 
-def parse_product_page(
-    product_url,
-    expected_store=None,
+def find_buy_link(
+    soup,
+    store,
 ):
-    soup = get_soup(
-        product_url
+
+    store_domain = (
+        "flipkart.com"
+        if store == "Flipkart"
+        else "myntra.com"
     )
 
-    page_text = " ".join(
+    # Prefer a link whose text actually says
+    # Flipkart/Myntra/Buy.
+    for link in soup.find_all(
+        "a",
+        href=True,
+    ):
+
+        href = link["href"]
+
+        if store_domain not in href.lower():
+            continue
+
+        text = " ".join(
+            link.stripped_strings
+        ).lower()
+
+        if (
+            store.lower() in text
+            or "buy" in text
+            or "shop" in text
+        ):
+            return href
+
+    # Fallback: any direct retailer URL.
+    for link in soup.find_all(
+        "a",
+        href=True,
+    ):
+
+        href = link["href"]
+
+        if store_domain in href.lower():
+            return href
+
+    return None
+
+
+# ============================================================
+# READ PRODUCT
+# ============================================================
+
+def parse_product(
+    candidate,
+):
+
+    url = candidate[
+        "tracker_url"
+    ]
+
+    expected_store = candidate[
+        "store"
+    ]
+
+    soup = get_soup(url)
+
+    text = " ".join(
         soup.stripped_strings
     )
 
-    # Product title.
     title = ""
 
     heading = soup.find("h1")
@@ -458,11 +713,10 @@ def parse_product_page(
     if not title:
         title = "Unknown product"
 
-    # Store.
     store = (
         expected_store
-        or normalise_store(page_text)
-        or normalise_store(product_url)
+        or normalise_store(text)
+        or normalise_store(url)
     )
 
     if store not in (
@@ -471,14 +725,12 @@ def parse_product_page(
     ):
         return None
 
-    # Current price.
     current = find_current_price(
-        page_text
+        text
     )
 
-    # Historical average.
     average, average_days = find_average(
-        page_text
+        text
     )
 
     if (
@@ -488,14 +740,13 @@ def parse_product_page(
     ):
         return None
 
-    # Direct retailer URL.
-    buy_url = extract_store_buy_link(
+    buy_url = find_buy_link(
         soup,
         store,
     )
 
     if not buy_url:
-        buy_url = product_url
+        buy_url = url
 
     return {
         "title": title,
@@ -503,16 +754,17 @@ def parse_product_page(
         "current": current,
         "average": average,
         "average_days": average_days,
-        "tracker_url": product_url,
+        "tracker_url": url,
         "buy_url": buy_url,
     }
 
 
 # ============================================================
-# PRODUCT DEDUPLICATION
+# PRODUCT KEY
 # ============================================================
 
 def product_key(item):
+
     title = re.sub(
         r"[^a-z0-9]+",
         " ",
@@ -531,6 +783,7 @@ def product_key(item):
 # ============================================================
 
 def escape_html(text):
+
     return (
         str(text)
         .replace("&", "&amp;")
@@ -543,6 +796,7 @@ def send_telegram(
     item,
     evidence,
 ):
+
     token = os.environ.get(
         "TELEGRAM_BOT_TOKEN"
     )
@@ -553,30 +807,38 @@ def send_telegram(
 
     if not token:
         raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing"
+            "TELEGRAM_BOT_TOKEN missing"
         )
 
     if not chat_id:
         raise RuntimeError(
-            "TELEGRAM_CHAT_ID is missing"
+            "TELEGRAM_CHAT_ID missing"
         )
 
-    current = item["current"]
-    average = item["average"]
+    current = item[
+        "current"
+    ]
 
-    drop = (
-        1 - current / average
+    average = item[
+        "average"
+    ]
+
+    discount = (
+        1
+        - current / average
     ) * 100
-
-    sources = ", ".join(
-        sorted(evidence)
-    )
 
     title = escape_html(
         item["title"]
     )
 
-    if item["average_days"]:
+    sources = ", ".join(
+        sorted(evidence)
+    )
+
+    if item[
+        "average_days"
+    ]:
         average_label = (
             f"{item['average_days']}-day average"
         )
@@ -594,11 +856,11 @@ def send_telegram(
         f"📊 {average_label}: "
         f"<b>₹{average:,.0f}</b>\n"
         f"📉 Below average: "
-        f"<b>{drop:.1f}%</b>\n"
-        f"🔎 Found by: {sources}\n\n"
-        "✅ Under ₹5,000\n"
-        "✅ At least 50% below average\n\n"
-        "⚠️ Verify seller, size/variant "
+        f"<b>{discount:.1f}%</b>\n"
+        f"🔎 Sources: {sources}\n\n"
+        "✅ Current price ≤ ₹5,000\n"
+        "✅ Current price ≤ 50% of average\n\n"
+        "⚠️ Check seller, size/variant "
         "and final checkout price."
     )
 
@@ -615,7 +877,9 @@ def send_telegram(
                             "🛒 BUY ON "
                             + item["store"].upper()
                         ),
-                        "url": item["buy_url"],
+                        "url": item[
+                            "buy_url"
+                        ],
                     }
                 ],
                 [
@@ -626,7 +890,7 @@ def send_telegram(
                         ],
                     }
                 ],
-            ]
+            ],
         },
     }
 
@@ -645,14 +909,19 @@ def send_telegram(
 # ============================================================
 
 def main():
+
+    print("")
     print(
-        "================================"
+        "========================================"
     )
     print(
-        "VIBHU PRICE SNIPER STARTING"
+        "       VIBHU PRICE SNIPER"
     )
     print(
-        "================================"
+        "       1000+ PRODUCT SCANNER"
+    )
+    print(
+        "========================================"
     )
 
     if not os.environ.get(
@@ -671,84 +940,69 @@ def main():
 
     state = load_state()
 
-    all_candidates = []
-
     # --------------------------------------------------------
-    # STEP 1: Discover candidates
+    # DISCOVERY
     # --------------------------------------------------------
 
-    for (
-        source_name,
-        source_url,
-    ) in SOURCE_PAGES:
+    candidates = discover_products()
 
-        found = discover_candidates(
-            source_name,
-            source_url,
-            max_candidates=60,
-        )
-
+    if len(candidates) < TARGET_PRODUCTS:
+        print("")
         print(
-            f"[{source_name}] "
-            f"found {len(found)} candidates"
+            "WARNING:"
+        )
+        print(
+            f"Only {len(candidates)} "
+            "products were discovered."
+        )
+        print(
+            "The public sources did not expose "
+            "1,000 unique products to this run."
         )
 
-        all_candidates.extend(
-            found
-        )
-
-        time.sleep(
-            REQUEST_DELAY
-        )
-
-    # --------------------------------------------------------
-    # STEP 2: Remove duplicate tracker URLs
-    # --------------------------------------------------------
-
-    unique_candidates = {}
-
-    for candidate in all_candidates:
-        unique_candidates[
-            candidate["tracker_url"]
-        ] = candidate
-
-    candidates = list(
-        unique_candidates.values()
-    )
-
+    # Take at least the first 1,000 when available.
     candidates = candidates[
-        :MAX_PRODUCT_PAGES
+        :TARGET_PRODUCTS
     ]
 
+    print("")
     print(
-        f"Unique candidates: "
+        "========================================"
+    )
+    print(
+        f"PRODUCT PAGES TO CHECK: "
         f"{len(candidates)}"
+    )
+    print(
+        "========================================"
     )
 
     # --------------------------------------------------------
-    # STEP 3: Read product pages
+    # READ PRODUCTS
     # --------------------------------------------------------
 
     grouped = {}
 
-    scanned = 0
-    errors = 0
+    successful = 0
+    failed = 0
 
-    for candidate in candidates:
+    for index, candidate in enumerate(
+        candidates,
+        start=1,
+    ):
+     try:
 
-        try:
-            item = parse_product_page(
-                candidate["tracker_url"],
-                candidate["store"],
+            item = parse_product(
+                candidate
             )
 
         except Exception as error:
-            errors += 1
+
+            failed += 1
 
             print(
-                "ERROR: "
-                f"{candidate['tracker_url']} "
-                f"-> {error}"
+                f"[{index}/{len(candidates)}] "
+                f"FAILED: {error}"
             )
 
             continue
@@ -756,74 +1010,108 @@ def main():
         if not item:
             continue
 
-        scanned += 1
+        successful += 1
 
-        # Ignore products above ₹5,000.
-        if item["current"] > MAX_PRICE:
+        # We don't need expensive processing
+        # for products already above ₹5,000.
+        if item[
+            "current"
+        ] > MAX_PRICE:
             continue
 
-        key = product_key(item)
+        key = product_key(
+            item
+        )
 
         if key not in grouped:
+
             grouped[key] = {
                 "item": item,
                 "evidence": set(),
             }
 
-        grouped[key]["evidence"].add(
-            candidate["source"]
+        grouped[key][
+            "evidence"
+        ].add(
+            candidate[
+                "source"
+            ]
         )
 
-        old_item = grouped[key]["item"]
+        old = grouped[key][
+            "item"
+        ]
 
-        # Prefer 30-day average if available.
+        # Prefer 30-day average.
         if (
-            item["average_days"] == 30
-            and old_item["average_days"] != 30
+            item[
+                "average_days"
+            ] == 30
+            and old[
+                "average_days"
+            ] != 30
         ):
-            grouped[key]["item"] = item
+            grouped[key][
+                "item"
+            ] = item
 
-        print(
-            f"{item['store']} | "
-            f"{item['title']} | "
-            f"₹{item['current']:,.0f} | "
-            f"avg ₹{item['average']:,.0f} | "
-            f"{item['average_days']}d"
-        )
+        if (
+            index % 25 == 0
+        ):
+            print(
+                f"Progress: "
+                f"{index}/{len(candidates)} "
+                f"pages checked | "
+                f"read={successful} | "
+                f"failed={failed}"
+            )
 
         time.sleep(
             REQUEST_DELAY
         )
 
     # --------------------------------------------------------
-    # STEP 4: Apply deal rule
+    # DEAL FILTER
     # --------------------------------------------------------
 
     qualified = 0
-    sent = 0
+    alerts = 0
 
     for group in grouped.values():
 
-        item = group["item"]
-        evidence = group["evidence"]
+        item = group[
+            "item"
+        ]
 
-        current = item["current"]
-        average = item["average"]
+        evidence = group[
+            "evidence"
+        ]
 
-        qualifies = (
+        current = item[
+            "current"
+        ]
+
+        average = item[
+            "average"
+        ]
+
+        if not (
             current <= MAX_PRICE
-            and current <= average * DROP_RATIO
-        )
-
-        if not qualifies:
+            and current
+            <= average * DROP_RATIO
+        ):
             continue
 
         qualified += 1
 
         state_key = (
-            item["store"]
+            item[
+                "store"
+            ]
             + "::"
-            + item["title"].lower()
+            + item[
+                "title"
+            ].lower()
         )
 
         now = int(
@@ -834,8 +1122,8 @@ def main():
             state_key
         )
 
-        # Do not repeatedly send the same
-        # deal for 7 days unless price falls.
+        # Repeat after 7 days only if price
+        # has not become lower.
         if (
             previous
             and previous.get(
@@ -854,75 +1142,93 @@ def main():
             continue
 
         try:
+
             send_telegram(
                 item,
                 evidence,
             )
 
-            state[state_key] = {
+            state[
+                state_key
+            ] = {
                 "price": current,
                 "time": now,
             }
 
-            sent += 1
+            alerts += 1
 
             print(
-                "ALERT SENT: "
-                f"{item['title']}"
+                "🚨 ALERT: "
+                f"{item['title']} | "
+                f"₹{current:,.0f} | "
+                f"avg ₹{average:,.0f}"
             )
 
         except Exception as error:
+
             print(
-                "TELEGRAM ERROR: "
+                "Telegram error: "
                 f"{error}"
             )
 
-        time.sleep(0.5)
+        time.sleep(
+            0.4
+        )
+
+    save_state(
+        state
+    )
 
     # --------------------------------------------------------
-    # STEP 5: Save state
+    # FINAL REPORT
     # --------------------------------------------------------
-
-    save_state(state)
 
     print("")
     print(
-        "================================"
+        "========================================"
     )
     print(
-        "SCAN COMPLETE"
+        "             FINAL REPORT"
     )
     print(
-        "================================"
+        "========================================"
     )
+
     print(
-        f"Total candidates: "
-        f"{len(all_candidates)}"
-    )
-    print(
-        f"Unique candidates: "
+        f"Products discovered: "
         f"{len(candidates)}"
     )
+
     print(
-        f"Product pages scanned: "
-        f"{scanned}"
+        f"Product pages successfully read: "
+        f"{successful}"
     )
+
     print(
-        f"Qualified deals: "
+        f"Product pages failed: "
+        f"{failed}"
+    )
+
+    print(
+        f"Unique products after filtering: "
+        f"{len(grouped)}"
+    )
+
+    print(
+        f"Qualified mega deals: "
         f"{qualified}"
     )
+
     print(
         f"Telegram alerts sent: "
-        f"{sent}"
+        f"{alerts}"
     )
+
     print(
-        f"Errors: "
-        f"{errors}"
-    )
-    print(
-        "================================"
+        "========================================"
     )
 
 
 if __name__ == "__main__":
     main()
+      
