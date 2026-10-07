@@ -1,294 +1,358 @@
 import os, re, json, time
-from datetime import datetime, timedelta
+from datetime import datetime
 from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 from playwright.sync_api import sync_playwright
 
 MAX_PRICE = 8000
-DROP = 0.45
-RECHECK_HOURS = 24
+MAX_PER_RUN = 100
+WORKERS = 4
 STATE_FILE = "state.json"
 
 BOT = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT = os.environ["TELEGRAM_CHAT_ID"]
 
-TRACKERS = [
-    ("PHA", "https://pricehistoryapp.com/"),
-    ("PTRAIL", "https://pricehistorytracker.in/"),
-    ("PDROPY", "https://pricedropy.com/")
+SEARCHES = [
+    "men shirts", "men t shirts", "men jeans",
+    "women tops", "women dresses", "women jeans",
+    "shoes", "sneakers", "footwear",
+    "earbuds", "headphones", "smartwatch",
+    "electronics", "laptop", "monitor",
+    "bags", "wallets"
 ]
 
-QUERIES = [
-    "men clothing", "women clothing",
-    "shoes", "footwear",
-    "electronics", "earbuds", "headphones",
-    "smartwatch", "laptop", "mobile", "monitor",
-    "bags", "wallet", "accessories"
-]
-
-def money(x):
-    if not x:
-        return None
-    x = x.replace(",", "")
-    m = re.search(r"(?:₹|Rs\.?|INR)\s*([0-9]+(?:\.[0-9]+)?)", x, re.I)
-    return float(m.group(1)) if m else None
 
 def load_state():
     try:
-        with open(STATE_FILE) as f:
+        with open(STATE_FILE, "r") as f:
             return json.load(f)
     except:
-        return {"checked": {}, "alerts": {}}
+        return {
+            "queue": [],
+            "checked": {},
+            "alerts": {}
+        }
 
-def save_state(s):
-    with open(STATE_FILE, "w") as f:
-        json.dump(s, f, indent=2)
 
-def send(msg):
-    requests.post(
-        f"https://api.telegram.org/bot{BOT}/sendMessage",
-        data={"chat_id": CHAT, "text": msg},
-        timeout=20
-    )
+def save_state(state):
+    tmp = STATE_FILE + ".tmp"
 
-def retailer(url):
-    return "myntra" if "myntra.com" in url else "flipkart"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
 
-def discover(page):
+    os.replace(tmp, STATE_FILE)
+
+
+def telegram(text):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT}/sendMessage",
+            data={
+                "chat_id": CHAT,
+                "text": text
+            },
+            timeout=15
+        )
+    except Exception as e:
+        print("Telegram error:", e)
+
+
+def discover():
     found = set()
 
-    for q in QUERIES:
-        for site in ["flipkart.com", "myntra.com"]:
-            url = "https://www.google.com/search?q=" + quote(
-                f"site:{site} {q}"
-            )
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
 
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                page.wait_for_timeout(1200)
+        for store in ["flipkart.com", "myntra.com"]:
 
-                for a in page.locator("a").all():
-                    href = a.get_attribute("href") or ""
+            for query in SEARCHES:
 
-                    if "flipkart.com" in href or "myntra.com" in href:
-                        if "/p/" in href or "/itm" in href:
+                print("SEARCH:", store, query)
+
+                try:
+                    url = (
+                        "https://www.google.com/search?q="
+                        + quote(f"site:{store} {query}")
+                    )
+
+                    page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=12000
+                    )
+
+                    page.wait_for_timeout(700)
+
+                    for a in page.locator("a").all():
+
+                        href = a.get_attribute("href") or ""
+
+                        if store not in href:
+                            continue
+
+                        if store == "flipkart.com":
+                            valid = "/p/" in href
+                        else:
+                            valid = "/buy/" in href
+
+                        if valid:
                             href = href.split("&")[0]
                             found.add(href)
 
-            except:
-                pass
+                except Exception as e:
+                    print("Search skipped:", e)
+
+        browser.close()
 
     return list(found)
 
-def get_price(page, url):
+
+def check_history(url):
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=15000)
-        page.wait_for_timeout(1500)
 
-        text = page.locator("body").inner_text()
+        with sync_playwright() as p:
 
-        vals = []
-        for m in re.findall(r"(?:₹|Rs\.?)\s*([0-9][0-9,]*)", text):
-            try:
-                v = float(m.replace(",", ""))
-                if 100 <= v <= MAX_PRICE:
-                    vals.append(v)
-            except:
-                pass
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-dev-shm-usage"]
+            )
 
-        return min(vals) if vals else None
-    except:
+            page = browser.new_page()
+
+            page.goto(
+                "https://pricehistoryapp.com/",
+                wait_until="domcontentloaded",
+                timeout=15000
+            )
+
+            page.wait_for_timeout(800)
+
+            inputs = page.locator("input").all()
+
+            box = None
+
+            for inp in inputs:
+
+                typ = (inp.get_attribute("type") or "").lower()
+                ph = (inp.get_attribute("placeholder") or "").lower()
+
+                if typ in ["text", "search", ""]:
+                    if (
+                        "url" in ph
+                        or "link" in ph
+                        or "product" in ph
+                        or ph == ""
+                    ):
+                        box = inp
+                        break
+
+            if box is None:
+                browser.close()
+                return None
+
+            box.fill(url)
+            box.press("Enter")
+
+            page.wait_for_timeout(1800)
+
+            text = page.locator("body").inner_text()
+
+            current = None
+            average = None
+
+            m = re.search(
+                r"Current:\s*₹\s*([\d,]+)",
+                text,
+                re.I
+            )
+
+            if m:
+                current = float(
+                    m.group(1).replace(",", "")
+                )
+
+            m = re.search(
+                r"30d\s*Average\s*₹?\s*([\d,]+)",
+                text,
+                re.I
+            )
+
+            if m:
+                average = float(
+                    m.group(1).replace(",", "")
+                )
+
+            browser.close()
+
+            if current is None or average is None:
+                return None
+
+            return current, average
+
+    except Exception as e:
+        print("History error:", str(e))
         return None
 
-def history(page, tracker, product):
-    try:
-        page.goto(tracker, wait_until="domcontentloaded", timeout=20000)
-        page.wait_for_timeout(1200)
-
-        inputs = page.locator("input").all()
-
-        target = None
-        for x in inputs:
-            ph = (x.get_attribute("placeholder") or "").lower()
-            typ = (x.get_attribute("type") or "").lower()
-
-            if typ in ("text", "search", ""):
-                if "link" in ph or "url" in ph or "product" in ph or not ph:
-                    target = x
-                    break
-
-        if not target:
-            return None, None
-
-        target.fill(product)
-        target.press("Enter")
-        page.wait_for_timeout(2500)
-
-        text = page.locator("body").inner_text()
-
-        current = None
-        avg30 = None
-
-        # Current price
-        patterns = [
-            r"Current\s*(?:Price)?\s*[:\-]?\s*₹\s*([\d,]+)",
-            r"Today\s*[:\-]?\s*₹\s*([\d,]+)",
-            r"Price\s*[:\-]?\s*₹\s*([\d,]+)"
-        ]
-
-        for p in patterns:
-            m = re.search(p, text, re.I)
-            if m:
-                current = float(m.group(1).replace(",", ""))
-                break
-
-        # EXACT 30-day average only
-        patterns = [
-            r"30\s*day\s*Average\s*[:\-]?\s*₹\s*([\d,]+)",
-            r"30d\s*Average\s*[:\-]?\s*₹\s*([\d,]+)",
-            r"30\s*Days?\s*Average\s*[:\-]?\s*₹\s*([\d,]+)"
-        ]
-
-        for p in patterns:
-            m = re.search(p, text, re.I)
-            if m:
-                avg30 = float(m.group(1).replace(",", ""))
-                break
-
-        return current, avg30
-
-    except:
-        return None, None
-
-def worker(name, tracker, products, results):
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-
-        for i, product in enumerate(products, 1):
-            print(f"{name} [{i}/{len(products)}] {product}")
-
-            current, avg = history(page, tracker, product)
-
-            if current and avg:
-                results.append({
-                    "url": product,
-                    "tracker": name,
-                    "current": current,
-                    "avg": avg
-                })
-
-            time.sleep(0.4)
-
-        browser.close()
 
 def main():
+
     state = load_state()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+    # -----------------------------
+    # DISCOVERY
+    # -----------------------------
 
-        print("Discovering Flipkart/Myntra products...")
-        products = discover(page)
+    print("Starting discovery...")
 
-        browser.close()
+    discovered = discover()
 
-    print("Products discovered:", len(products))
+    print("Discovered:", len(discovered))
 
-    now = datetime.utcnow()
+    known = set(state["queue"])
+    known.update(state["checked"].keys())
 
-    # Remove products checked during the last 24 hours
-    todo = []
+    added = 0
 
-    for url in products:
-        last = state["checked"].get(url)
+    for url in discovered:
 
-        if last:
-            try:
-                t = datetime.fromisoformat(last)
-                if now - t < timedelta(hours=RECHECK_HOURS):
-                    continue
-            except:
-                pass
+        if url not in known:
 
-        todo.append(url)
+            state["queue"].append(url)
+            known.add(url)
+            added += 1
 
-    print("New products to history-check:", len(todo))
+    print("New URLs:", added)
+    print("Queue:", len(state["queue"]))
 
-    if not todo:
-        print("Nothing new to check.")
+    save_state(state)
+
+    # -----------------------------
+    # TAKE BATCH
+    # -----------------------------
+
+    batch = state["queue"][:MAX_PER_RUN]
+
+    if not batch:
+
+        print("Nothing to check.")
         return
 
-    # Split equally between 3 trackers
-    buckets = [[], [], []]
+    print("Checking:", len(batch))
 
-    for i, url in enumerate(todo):
-        buckets[i % 3].append(url)
+    # Remove batch immediately.
+    # Results are saved individually below.
+    state["queue"] = state["queue"][len(batch):]
 
-    results = [[], [], []]
+    save_state(state)
 
-    import threading
+    # -----------------------------
+    # PARALLEL HISTORY CHECK
+    # -----------------------------
 
-    threads = []
+    results = {}
 
-    for i, (name, tracker) in enumerate(TRACKERS):
-        t = threading.Thread(
-            target=worker,
-            args=(name, tracker, buckets[i], results[i])
+    with ThreadPoolExecutor(
+        max_workers=WORKERS
+    ) as executor:
+
+        jobs = {
+            executor.submit(check_history, url): url
+            for url in batch
+        }
+
+        for n, future in enumerate(
+            as_completed(jobs), 1
+        ):
+
+            url = jobs[future]
+
+            try:
+                result = future.result()
+            except:
+                result = None
+
+            results[url] = result
+
+            print(
+                f"[{n}/{len(batch)}]",
+                result,
+                url
+            )
+
+    # -----------------------------
+    # PROCESS RESULTS
+    # -----------------------------
+
+    checked_time = datetime.utcnow().isoformat()
+
+    for url in batch:
+
+        result = results.get(url)
+
+        state["checked"][url] = {
+            "time": checked_time,
+            "result": result
+        }
+
+        if not result:
+            continue
+
+        current, average = result
+
+        if current >= MAX_PRICE:
+            continue
+
+        if average <= 0:
+            continue
+
+        ratio = current / average
+
+        # Must be at least 45% below average
+        if ratio > 0.55:
+            continue
+
+        drop = (1 - ratio) * 100
+
+        signature = (
+            str(round(current)) +
+            ":" +
+            str(round(average))
         )
-        t.start()
-        threads.append(t)
-
-    for t in threads:
-        t.join()
-
-    qualified = []
-
-    for group in results:
-        for r in group:
-            url = r["url"]
-            current = r["current"]
-            avg = r["avg"]
-
-            state["checked"][url] = now.isoformat()
-
-            if current <= MAX_PRICE and current <= avg * (1 - DROP):
-                qualified.append(r)
-
-    print("History results:", sum(len(x) for x in results))
-    print("Qualified:", len(qualified))
-
-    # Telegram alerts
-    for r in qualified:
-        url = r["url"]
-        current = r["current"]
-        avg = r["avg"]
-
-        drop = (1 - current / avg) * 100
-
-        signature = f"{round(current)}:{round(avg)}"
 
         if state["alerts"].get(url) == signature:
             continue
 
-        msg = (
+        message = (
             "🚨 BLOCKBUSTER DEAL\n\n"
             f"Current: ₹{current:,.0f}\n"
-            f"30-day average: ₹{avg:,.0f}\n"
-            f"Below 30d average: {drop:.1f}%\n"
-            f"Tracker: {r['tracker']}\n\n"
+            f"30-day average: ₹{average:,.0f}\n"
+            f"Below 30d average: {drop:.1f}%\n\n"
             f"{url}"
         )
 
-        try:
-            send(msg)
-            state["alerts"][url] = signature
-            print("ALERT:", url)
-        except Exception as e:
-            print("Telegram error:", e)
+        telegram(message)
+
+        state["alerts"][url] = signature
+
+        print("🔥 ALERT SENT:", url)
 
     save_state(state)
+
+    print()
+    print("========== DONE ==========")
+    print("Checked:", len(batch))
+    print("Qualified:", sum(
+        1 for x in results.values()
+        if x and x[0] < MAX_PRICE
+        and x[1] > 0
+        and x[0] / x[1] <= 0.55
+    ))
+    print("Remaining queue:", len(state["queue"]))
+    print("===========================")
+
 
 if __name__ == "__main__":
     main()
