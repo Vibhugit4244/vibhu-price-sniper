@@ -5,28 +5,19 @@ from urllib.parse import urljoin
 MAX_PRICE=8000
 DROP=.45
 MAX_ALERTS=10
-H={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36"}
+H={"User-Agent":"Mozilla/5.0"}
 
 S=requests.Session()
 S.headers.update(H)
 
-# Store discovery pages
 PAGES=[
-    # Myntra clothing
-    "https://www.myntra.com/men-clothing?rf=Discount%20Range%3A40.0_100.0_40.0%20TO%20100.0",
-    "https://www.myntra.com/women-clothing?rf=Discount%20Range%3A40.0_100.0_40.0%20TO%20100.0",
-
-    # Myntra footwear
-    "https://www.myntra.com/men-shoes?rf=Discount%20Range%3A40.0_100.0_40.0%20TO%20100.0",
-    "https://www.myntra.com/women-shoes?rf=Discount%20Range%3A40.0_100.0_40.0%20TO%20100.0",
-
-    # Myntra electronics
-    "https://www.myntra.com/electronics?rf=Discount%20Range%3A40.0_100.0_40.0%20TO%20100.0",
-
-    # Flipkart broad discounted catalogue
-    "https://www.flipkart.com/search?q=clothing&otracker=search&sort=discount_desc",
-    "https://www.flipkart.com/search?q=shoes&otracker=search&sort=discount_desc",
-    "https://www.flipkart.com/search?q=electronics&otracker=search&sort=discount_desc",
+ "https://www.myntra.com/men-clothing",
+ "https://www.myntra.com/women-clothing",
+ "https://www.myntra.com/shoes",
+ "https://www.myntra.com/electronics",
+ "https://www.flipkart.com/search?q=clothing",
+ "https://www.flipkart.com/search?q=shoes",
+ "https://www.flipkart.com/search?q=electronics"
 ]
 
 def get(u):
@@ -37,83 +28,79 @@ def get(u):
         return None
 
 def money(x):
-    try:
-        return float(re.sub(r"[^\d.]","",x.replace(",","")))
-    except:
-        return 0
+    try:return float(re.sub(r"[^\d.]","",x.replace(",","")))
+    except:return 0
 
-def products(page):
-    r=get(page)
+def retailer_products(url):
+    r=get(url)
     if not r:return []
 
     s=BeautifulSoup(r.text,"html.parser")
     out=[]
 
     for a in s.select("a[href]"):
-        href=urljoin(page,a.get("href",""))
-        text=a.get_text(" ",strip=True)
+        h=urljoin(url,a.get("href",""))
 
-        if "myntra.com/" in href:
-            if re.search(r"/[^/]+/\d+/\d+/",href):
-                out.append(href.split("?")[0])
+        if "myntra.com/" in h:
+            if re.search(r"/[^/]+/\d+/\d+",h):
+                out.append(h.split("?")[0])
 
-        elif "flipkart.com/" in href:
-            if "/p/" in href:
-                out.append(href.split("?")[0])
+        elif "flipkart.com/" in h and "/p/" in h:
+            out.append(h.split("?")[0])
 
     return list(dict.fromkeys(out))
 
-def retailer_price(url):
+def price(url):
     r=get(url)
     if not r:return 0
 
     s=BeautifulSoup(r.text,"html.parser")
 
-    # JSON-LD current selling price
+    # Prefer structured current selling price
     for x in s.select('script[type="application/ld+json"]'):
         try:
             d=json.loads(x.string or "")
-            items=d if isinstance(d,list) else [d]
-            for z in items:
-                if isinstance(z,dict):
-                    o=z.get("offers",{})
-                    if isinstance(o,list):o=o[0] if o else {}
-                    p=o.get("price")
-                    if p:
-                        p=float(p)
-                        if 0<p<MAX_PRICE:
-                            return p
+            if isinstance(d,list):
+                ds=d
+            else:
+                ds=[d]
+
+            for z in ds:
+                if not isinstance(z,dict):continue
+                o=z.get("offers",{})
+                if isinstance(o,list):
+                    o=o[0] if o else {}
+                p=o.get("price")
+                if p:
+                    p=money(str(p))
+                    if 0<p<MAX_PRICE:
+                        return p
         except:
             pass
-
-    # visible current price
-    t=s.get_text(" ",strip=True)
-    vals=re.findall(r"₹\s*([\d,]+)",t)
-
-    for v in vals:
-        p=money(v)
-        if 0<p<MAX_PRICE:
-            return p
 
     return 0
 
 def tracker(url):
-    # PriceHistoryApp accepts retailer URLs through its product lookup.
+    # PriceHistoryApp public URL lookup
     r=get("https://pricehistoryapp.com/")
     if not r:return None
 
     s=BeautifulSoup(r.text,"html.parser")
 
-    forms=s.select("form")
-    for f in forms:
+    for f in s.select("form"):
         inp=f.select_one("input")
         if not inp:continue
 
+        name=inp.get("name","url")
         action=urljoin("https://pricehistoryapp.com/",f.get("action",""))
-        data={inp.get("name","url"):url}
 
         try:
-            q=S.post(action,data=data,timeout=15)
+            q=S.post(
+                action,
+                data={name:url},
+                timeout=15
+            )
+
             if q.ok and "30d Average" in q.text:
                 return BeautifulSoup(q.text,"html.parser")
         except:
@@ -123,55 +110,93 @@ def tracker(url):
 
 def avg30(s):
     if not s:return 0
+
     t=s.get_text(" ",strip=True)
-    m=re.search(r"30d\s*Average\s*₹\s*([\d,]+)",t,re.I)
+
+    m=re.search(
+        r"30d\s*Average\s*₹\s*([\d,]+)",
+        t,
+        re.I
+    )
+
     return money(m.group(1)) if m else 0
 
 def title(s):
     if not s:return "Deal"
+
     h=s.select_one("h1")
     if h:return h.get_text(" ",strip=True)
+
     return s.title.get_text(" ",strip=True) if s.title else "Deal"
 
 def main():
+
     urls=[]
 
-    for p in PAGES:
-        urls += products(p)
+    for page in PAGES:
+        urls+=retailer_products(page)
 
     urls=list(dict.fromkeys(urls))
+
     print("Products discovered:",len(urls))
 
+    under=0
+    checked=0
     deals=[]
 
     for i,u in enumerate(urls,1):
-        price=retailer_price(u)
 
-        # IMPORTANT: current selling price, NOT MRP
-        if not price or price>=MAX_PRICE:
+        # FIRST FILTER: actual current selling price
+        p=price(u)
+
+        if not p or p>=MAX_PRICE:
             continue
 
+        under+=1
+
+        # SECOND STEP: historical-price check
         tr=tracker(u)
+
+        if not tr:
+            continue
+
+        checked+=1
+
         avg=avg30(tr)
 
         if not avg:
             continue
 
-        drop=(avg-price)/avg
+        drop=(avg-p)/avg
 
-        if drop>=DROP:
-            deals.append({
-                "url":u,
-                "price":price,
-                "avg":avg,
-                "drop":round(drop*100),
-                "title":title(tr)
-            })
+        # FINAL RULE: >=45% below 30-day average
+        if drop< DROP:
+            continue
+
+        deals.append({
+            "url":u,
+            "price":p,
+            "avg":avg,
+            "drop":round(drop*100),
+            "title":title(tr)
+        })
+
+        print(
+            f"🔥 DEAL {round(drop*100)}% | "
+            f"₹{p:,.0f} | {title(tr)}"
+        )
 
         if i%25==0:
-            print(f"Checked {i}/{len(urls)}")
+            print(f"Progress: {i}/{len(urls)}")
 
-    deals.sort(key=lambda x:x["drop"],reverse=True)
+    deals.sort(
+        key=lambda x:x["drop"],
+        reverse=True
+    )
+
+    print("Under ₹8,000:",under)
+    print("History checked:",checked)
+    print("Qualified:",len(deals))
 
     try:
         with open("state.json") as f:
@@ -185,16 +210,17 @@ def main():
     sent=0
 
     for x in deals[:MAX_ALERTS]:
+
         if x["url"] in state:
             continue
 
-        msg=f"""🔥 REAL DEAL — {x["drop"]}% BELOW 30D AVG
+        msg=f"""🔥 BLOCKBUSTER DEAL
 
 {x["title"]}
 
 💰 Current: ₹{x["price"]:,.0f}
 📊 30-Day Average: ₹{x["avg"]:,.0f}
-📉 Historical Drop: {x["drop"]}%
+📉 Below 30-Day Avg: {x["drop"]}%
 
 🛒 BUY NOW:
 {x["url"]}"""
@@ -202,18 +228,22 @@ def main():
         try:
             requests.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
-                data={"chat_id":chat,"text":msg},
+                data={
+                    "chat_id":chat,
+                    "text":msg
+                },
                 timeout=10
             )
+
             state[x["url"]]=1
             sent+=1
+
         except:
             pass
 
     with open("state.json","w") as f:
         json.dump(state,f,indent=2)
 
-    print("Qualified:",len(deals))
     print("Alerts sent:",sent)
 
 if __name__=="__main__":
