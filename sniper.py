@@ -2,130 +2,141 @@ import os
 import re
 import json
 import time
+import traceback
 from urllib.parse import quote, urlparse
 
 import requests
 from playwright.sync_api import sync_playwright
 
 
-# =========================
-# SETTINGS
-# =========================
-
 MAX_PRICE = 8000
-MIN_DROP_PERCENT = 45
+MIN_DROP = 45
 BATCH_SIZE = 50
 RECHECK_HOURS = 24
 STATE_FILE = "state.json"
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
-# =========================
-# SEARCHES
-# =========================
-
-FLIPKART_SEARCHES = [
-    "men shirts",
-    "men t shirts",
-    "men jeans",
-    "men trousers",
-    "men pants",
-    "women tops",
-    "women shirts",
-    "women t shirts",
-    "women dresses",
-    "women jeans",
-    "women trousers",
-    "women pants",
-    "shoes",
-    "sneakers",
-    "sports shoes",
-    "sandals",
-    "flats",
-    "heels",
+FLIPKART_TERMS = [
+    "men shirts", "men t shirts", "men jeans", "men trousers",
+    "men pants", "women tops", "women shirts", "women t shirts",
+    "women dresses", "women jeans", "women trousers", "women pants",
+    "shoes", "sneakers", "sports shoes", "sandals", "flats", "heels"
 ]
 
-MYNTRA_SEARCHES = [
-    "men-shirts",
-    "men-tshirts",
-    "men-jeans",
-    "men-trousers",
-    "men-pants",
-    "women-tops",
-    "women-shirts",
-    "women-tshirts",
-    "women-dresses",
-    "women-jeans",
-    "women-trousers",
-    "women-pants",
-    "men-shoes",
-    "women-shoes",
-    "sneakers",
-    "sports-shoes",
-    "sandals",
-    "flats",
-    "heels",
+MYNTRA_TERMS = [
+    "men-shirts", "men-tshirts", "men-jeans", "men-trousers",
+    "men-pants", "women-tops", "women-shirts", "women-tshirts",
+    "women-dresses", "women-jeans", "women-trousers", "women-pants",
+    "men-shoes", "women-shoes", "sneakers", "sports-shoes",
+    "sandals", "flats", "heels"
 ]
 
 
-# =========================
+def store_of(url):
+    host = urlparse(url).netloc.lower()
+    if "flipkart.com" in host:
+        return "flipkart"
+    if "myntra.com" in host:
+        return "myntra"
+    return None
+
+
+def clean_url(url):
+    try:
+        p = urlparse(url)
+        if not p.scheme or not p.netloc:
+            return None
+        return f"{p.scheme}://{p.netloc}{p.path}".rstrip("/")
+    except Exception:
+        return None
+
+
+def product_url(url):
+    u = clean_url(url)
+    if not u:
+        return False
+    s = store_of(u)
+    if s == "flipkart":
+        return "/p/" in urlparse(u).path
+    if s == "myntra":
+        return "/buy/" in urlparse(u).path
+    return False
+
+
+def price(value):
+    if value is None:
+        return None
+    try:
+        m = re.search(
+            r"(?:₹|Rs\.?\s*)?\s*([\d,]+(?:\.\d+)?)",
+            str(value)
+        )
+        if not m:
+            return None
+        n = float(m.group(1).replace(",", ""))
+        if 1 <= n <= 1000000:
+            return n
+    except Exception:
+        pass
+    return None
+
+
+# --------------------------------------------------
 # STATE
-# =========================
+# --------------------------------------------------
 
 def load_state():
-    """
-    Loads both the new state format and old formats.
-    This prevents crashes caused by older state.json files.
-    """
-
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            state = json.load(f)
+        with open(STATE_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
     except Exception:
-        state = {}
+        raw = {}
 
-    if not isinstance(state, dict):
-        state = {}
+    if not isinstance(raw, dict):
+        raw = {}
 
-    queue = state.get("queue", {})
-    checked = state.get("checked", {})
-    sent = state.get("sent", [])
+    q = raw.get("queue", {})
+    checked = raw.get("checked", {})
+    sent = raw.get("sent", [])
 
-    # Old queue may be a LIST.
-    if isinstance(queue, list):
-        new_queue = {}
+    new_q = {}
 
-        for item in queue:
+    if isinstance(q, dict):
+        for k, v in q.items():
+            if isinstance(v, dict):
+                u = v.get("url") or k
+            else:
+                u = k
+
+            if u and product_url(u):
+                new_q[u] = {
+                    "url": u,
+                    "store": store_of(u),
+                    "added": (
+                        v.get("added", time.time())
+                        if isinstance(v, dict)
+                        else time.time()
+                    )
+                }
+
+    elif isinstance(q, list):
+        for item in q:
             if isinstance(item, str):
-                url = item
-                store = detect_store(url)
-
-                if store:
-                    new_queue[url] = {
-                        "url": url,
-                        "store": store,
-                        "added": time.time(),
-                    }
-
+                u = item
             elif isinstance(item, dict):
-                url = item.get("url")
+                u = item.get("url")
+            else:
+                continue
 
-                if url:
-                    store = item.get("store") or detect_store(url)
-
-                    if store:
-                        new_queue[url] = {
-                            "url": url,
-                            "store": store,
-                            "added": item.get("added", time.time()),
-                        }
-
-        queue = new_queue
-
-    elif not isinstance(queue, dict):
-        queue = {}
+            if u and product_url(u):
+                new_q[u] = {
+                    "url": u,
+                    "store": store_of(u),
+                    "added": time.time()
+                }
 
     if not isinstance(checked, dict):
         checked = {}
@@ -133,215 +144,144 @@ def load_state():
     if not isinstance(sent, list):
         sent = []
 
-    state["queue"] = queue
-    state["checked"] = checked
-    state["sent"] = sent
-
-    return state
+    return {
+        "queue": new_q,
+        "checked": checked,
+        "sent": sent
+    }
 
 
 def save_state(state):
-    temp = STATE_FILE + ".tmp"
-
-    with open(temp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-
-    os.replace(temp, STATE_FILE)
-
-
-# =========================
-# HELPERS
-# =========================
-
-def detect_store(url):
-    host = urlparse(url).netloc.lower()
-
-    if "flipkart.com" in host:
-        return "flipkart"
-
-    if "myntra.com" in host:
-        return "myntra"
-
-    return None
-
-
-def clean_url(url):
     try:
-        p = urlparse(url)
+        with open(STATE_FILE + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
 
-        if not p.scheme or not p.netloc:
-            return None
-
-        return f"{p.scheme}://{p.netloc}{p.path}".rstrip("/")
-
-    except Exception:
-        return None
-
-
-def valid_product_url(url):
-    url = clean_url(url)
-
-    if not url:
-        return False
-
-    store = detect_store(url)
-
-    if store == "flipkart":
-        return "/p/" in urlparse(url).path
-
-    if store == "myntra":
-        return "/buy/" in urlparse(url).path
-
-    return False
-
-
-def parse_price(value):
-    if value is None:
-        return None
-
-    text = str(value)
-    text = text.replace(",", "")
-
-    match = re.search(r"(?:₹|Rs\.?\s*)?(\d+(?:\.\d{1,2})?)", text)
-
-    if not match:
-        return None
-
-    try:
-        price = float(match.group(1))
-
-        if 1 <= price <= 1000000:
-            return price
-
-    except Exception:
-        pass
-
-    return None
-
-
-# =========================
-# TELEGRAM
-# =========================
-
-def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("TELEGRAM: secrets missing")
-        return False
-
-    try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "disable_web_page_preview": False,
-            },
-            timeout=20,
-        )
-
-        response.raise_for_status()
-        return True
-
+        os.replace(STATE_FILE + ".tmp", STATE_FILE)
     except Exception as e:
-        print("TELEGRAM ERROR:", str(e)[:200])
+        print("STATE SAVE ERROR:", repr(e))
+
+
+# --------------------------------------------------
+# TELEGRAM
+# --------------------------------------------------
+
+def telegram(text):
+    if not TOKEN or not CHAT_ID:
+        print("TELEGRAM SECRETS NOT FOUND")
+        return False
+
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            data={
+                "chat_id": CHAT_ID,
+                "text": text,
+                "disable_web_page_preview": False
+            },
+            timeout=20
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        print("TELEGRAM ERROR:", repr(e))
         return False
 
 
-# =========================
+# --------------------------------------------------
 # DISCOVERY
-# =========================
+# --------------------------------------------------
 
-def add_products_from_page(page, store, search_url, state):
+def discover_search(page, store, url, state):
     try:
         page.goto(
-            search_url,
+            url,
             wait_until="domcontentloaded",
-            timeout=35000,
+            timeout=30000
         )
-
-        page.wait_for_timeout(1800)
+        page.wait_for_timeout(1500)
 
         links = page.locator("a[href]").evaluate_all(
-            "(els) => els.map(a => a.href)"
+            "(x)=>x.map(a=>a.href)"
         )
 
-        added = 0
+        count = 0
 
-        for raw_url in links:
-            url = clean_url(raw_url)
+        for raw in links:
+            try:
+                u = clean_url(raw)
 
-            if not url:
+                if not u or not product_url(u):
+                    continue
+
+                if store_of(u) != store:
+                    continue
+
+                if u in state["queue"]:
+                    continue
+
+                state["queue"][u] = {
+                    "url": u,
+                    "store": store,
+                    "added": time.time()
+                }
+
+                count += 1
+
+            except Exception:
                 continue
 
-            if detect_store(url) != store:
-                continue
-
-            if not valid_product_url(url):
-                continue
-
-            if url in state["queue"]:
-                continue
-
-            state["queue"][url] = {
-                "url": url,
-                "store": store,
-                "added": time.time(),
-            }
-
-            added += 1
-
-        return added
+        return count
 
     except Exception as e:
-        print("DISCOVERY ERROR:", str(e)[:180])
+        print("DISCOVERY ERROR:", repr(e))
         return 0
 
 
 def discover(page, state):
     total = 0
 
-    for term in FLIPKART_SEARCHES:
-        url = (
-            "https://www.flipkart.com/search?q="
-            + quote(term)
-        )
+    for term in FLIPKART_TERMS:
+        try:
+            url = (
+                "https://www.flipkart.com/search?q="
+                + quote(term)
+            )
 
-        added = add_products_from_page(
-            page,
-            "flipkart",
-            url,
-            state,
-        )
+            n = discover_search(
+                page, "flipkart", url, state
+            )
 
-        total += added
-        print("FLIPKART:", term, "+", added)
+            print("FLIPKART:", term, "+", n)
+            total += n
+            save_state(state)
 
-        save_state(state)
+        except Exception as e:
+            print("FLIPKART TERM ERROR:", term, repr(e))
 
-    for term in MYNTRA_SEARCHES:
-        url = "https://www.myntra.com/" + term
+    for term in MYNTRA_TERMS:
+        try:
+            url = "https://www.myntra.com/" + term
 
-        added = add_products_from_page(
-            page,
-            "myntra",
-            url,
-            state,
-        )
+            n = discover_search(
+                page, "myntra", url, state
+            )
 
-        total += added
-        print("MYNTRA:", term, "+", added)
+            print("MYNTRA:", term, "+", n)
+            total += n
+            save_state(state)
 
-        save_state(state)
+        except Exception as e:
+            print("MYNTRA TERM ERROR:", term, repr(e))
 
     print("NEW PRODUCTS:", total)
     print("TOTAL QUEUE:", len(state["queue"]))
 
 
-# =========================
-# LIVE RETAILER PRICE
-# =========================
+# --------------------------------------------------
+# LIVE PRICE
+# --------------------------------------------------
 
-def get_jsonld_price(page):
+def jsonld_price(page):
     try:
         scripts = page.locator(
             'script[type="application/ld+json"]'
@@ -353,30 +293,28 @@ def get_jsonld_price(page):
             except Exception:
                 continue
 
-            objects = []
+            objs = []
 
-            if isinstance(data, list):
-                objects.extend(data)
-            elif isinstance(data, dict):
-                objects.append(data)
+            if isinstance(data, dict):
+                objs.append(data)
+                if isinstance(data.get("@graph"), list):
+                    objs.extend(data["@graph"])
 
-                graph = data.get("@graph")
+            elif isinstance(data, list):
+                objs.extend(data)
 
-                if isinstance(graph, list):
-                    objects.extend(graph)
-
-            for obj in objects:
+            for obj in objs:
                 if not isinstance(obj, dict):
                     continue
 
-                object_type = obj.get("@type")
+                typ = obj.get("@type")
 
-                if isinstance(object_type, list):
-                    is_product = "Product" in object_type
+                if isinstance(typ, list):
+                    ok = "Product" in typ
                 else:
-                    is_product = object_type == "Product"
+                    ok = typ == "Product"
 
-                if not is_product:
+                if not ok:
                     continue
 
                 offers = obj.get("offers")
@@ -387,19 +325,16 @@ def get_jsonld_price(page):
                 if not isinstance(offers, list):
                     continue
 
-                prices = []
+                vals = []
 
                 for offer in offers:
-                    if not isinstance(offer, dict):
-                        continue
+                    if isinstance(offer, dict):
+                        p = price(offer.get("price"))
+                        if p:
+                            vals.append(p)
 
-                    price = parse_price(offer.get("price"))
-
-                    if price:
-                        prices.append(price)
-
-                if prices:
-                    return min(prices)
+                if vals:
+                    return min(vals)
 
     except Exception:
         pass
@@ -407,27 +342,22 @@ def get_jsonld_price(page):
     return None
 
 
-def get_meta_price(page):
-    selectors = [
+def meta_price(page):
+    for selector in [
         'meta[property="product:price:amount"]',
         'meta[property="og:price:amount"]',
-        'meta[itemprop="price"]',
-    ]
-
-    for selector in selectors:
+        'meta[itemprop="price"]'
+    ]:
         try:
-            locator = page.locator(selector).first
+            x = page.locator(selector).first
 
-            if locator.count():
-                value = (
-                    locator.get_attribute("content")
-                    or locator.get_attribute("value")
+            if x.count():
+                p = price(
+                    x.get_attribute("content")
                 )
 
-                price = parse_price(value)
-
-                if price:
-                    return price
+                if p:
+                    return p
 
         except Exception:
             pass
@@ -435,154 +365,128 @@ def get_meta_price(page):
     return None
 
 
-def get_retailer_price(page, store, url):
+def live_price(page, store, url):
     try:
         page.goto(
             url,
             wait_until="domcontentloaded",
-            timeout=35000,
+            timeout=30000
         )
 
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(1200)
 
-        # First choice: structured product data.
-        price = get_jsonld_price(page)
+        p = jsonld_price(page)
 
-        if price and price < MAX_PRICE:
-            return price
+        if p and p < MAX_PRICE:
+            return p
 
-        # Second choice: product price metadata.
-        price = get_meta_price(page)
+        p = meta_price(page)
 
-        if price and price < MAX_PRICE:
-            return price
+        if p and p < MAX_PRICE:
+            return p
 
     except Exception as e:
-        print("LIVE PRICE ERROR:", str(e)[:180])
+        print("LIVE ERROR:", repr(e))
 
     return None
 
 
-# =========================
-# PRICEHISTORYAPP
-# =========================
+# --------------------------------------------------
+# PRICE HISTORY
+# --------------------------------------------------
 
-def find_history_values(text):
-    """
-    Extracts the 30-day average and all-time low
-    only from labelled sections.
-    """
-
-    average_patterns = [
-        r"30\s*day\s*average.{0,80}?₹\s*([\d,]+(?:\.\d+)?)",
-        r"30\s*day\s*avg.{0,80}?₹\s*([\d,]+(?:\.\d+)?)",
-        r"30d\s*average.{0,80}?₹\s*([\d,]+(?:\.\d+)?)",
-    ]
-
-    low_patterns = [
-        r"all[\s-]*time\s*low.{0,80}?₹\s*([\d,]+(?:\.\d+)?)",
-        r"all[\s-]*time\s*lowest.{0,80}?₹\s*([\d,]+(?:\.\d+)?)",
-    ]
-
-    average = None
+def history_values(text):
+    avg = None
     low = None
 
-    for pattern in average_patterns:
-        match = re.search(pattern, text, re.I | re.S)
+    patterns_avg = [
+        r"30\s*day\s*average.{0,100}?₹\s*([\d,]+)",
+        r"30\s*day\s*avg.{0,100}?₹\s*([\d,]+)",
+        r"30d\s*average.{0,100}?₹\s*([\d,]+)"
+    ]
 
-        if match:
-            average = parse_price(match.group(1))
+    patterns_low = [
+        r"all[\s-]*time\s*low.{0,100}?₹\s*([\d,]+)",
+        r"all[\s-]*time\s*lowest.{0,100}?₹\s*([\d,]+)"
+    ]
+
+    for pat in patterns_avg:
+        m = re.search(pat, text, re.I | re.S)
+        if m:
+            avg = price(m.group(1))
             break
 
-    for pattern in low_patterns:
-        match = re.search(pattern, text, re.I | re.S)
-
-        if match:
-            low = parse_price(match.group(1))
+    for pat in patterns_low:
+        m = re.search(pat, text, re.I | re.S)
+        if m:
+            low = price(m.group(1))
             break
 
-    return average, low
+    return avg, low
 
 
-def history_lookup(page, retailer_url):
+def history(page, retailer_url):
     try:
         page.goto(
             "https://pricehistoryapp.com/",
             wait_until="domcontentloaded",
-            timeout=35000,
+            timeout=30000
         )
 
-        page.wait_for_timeout(1200)
+        page.wait_for_timeout(1000)
 
         inputs = page.locator("input")
 
         if inputs.count() == 0:
             return None
 
-        target = None
+        target = inputs.first
 
         for i in range(inputs.count()):
-            inp = inputs.nth(i)
+            x = inputs.nth(i)
 
-            placeholder = (
-                inp.get_attribute("placeholder") or ""
+            text = (
+                (x.get_attribute("placeholder") or "")
+                + " "
+                + (x.get_attribute("aria-label") or "")
             ).lower()
 
-            aria = (
-                inp.get_attribute("aria-label") or ""
-            ).lower()
-
-            input_type = (
-                inp.get_attribute("type") or ""
-            ).lower()
-
-            combined = (
-                placeholder + " " + aria + " " + input_type
-            )
-
-            if (
-                "url" in combined
-                or "link" in combined
-                or "product" in combined
-            ):
-                target = inp
+            if "url" in text or "link" in text:
+                target = x
                 break
-
-        if target is None:
-            target = inputs.first
 
         target.fill(retailer_url)
 
-        buttons = page.locator("button")
-
         clicked = False
 
+        buttons = page.locator("button")
+
         for i in range(buttons.count()):
-            button = buttons.nth(i)
+            b = buttons.nth(i)
 
             try:
-                text = button.inner_text().strip().lower()
+                t = b.inner_text().lower()
             except Exception:
-                text = ""
+                t = ""
 
             if (
-                "track" in text
-                or "check" in text
-                or "search" in text
+                "track" in t
+                or "check" in t
+                or "search" in t
             ):
-                button.click()
+                b.click()
                 clicked = True
                 break
 
         if not clicked:
             target.press("Enter")
 
-        page.wait_for_timeout(4000)
+        page.wait_for_timeout(3500)
 
-        # If the homepage returned a product-history link,
-        # follow it.
         if "/product/" not in page.url:
-            links = page.locator('a[href*="/product/"]')
+            links = page.locator(
+                'a[href*="/product/"]'
+            )
 
             if links.count():
                 href = links.first.get_attribute("href")
@@ -597,271 +501,236 @@ def history_lookup(page, retailer_url):
                     page.goto(
                         href,
                         wait_until="domcontentloaded",
-                        timeout=30000,
+                        timeout=30000
                     )
 
-                    page.wait_for_timeout(1200)
+                    page.wait_for_timeout(1000)
 
         if "/product/" not in page.url:
             return None
 
-        text = page.locator("body").inner_text(
+        body = page.locator("body").inner_text(
             timeout=10000
         )
 
-        average, low = find_history_values(text)
+        avg, low = history_values(body)
 
-        if not average:
+        if not avg:
             return None
 
         return {
-            "avg30": average,
+            "avg": avg,
             "low": low,
-            "history_url": page.url,
+            "url": page.url
         }
 
     except Exception as e:
-        print("HISTORY ERROR:", str(e)[:180])
+        print("HISTORY ERROR:", repr(e))
         return None
 
 
-# =========================
-# DEAL CALCULATION
-# =========================
-
-def deal_message(store, current, average, low, drop, url, history_url):
-    if drop >= 75:
-        title = "💥 UNPRECEDENTED DEAL"
-    elif drop >= 65:
-        title = "🔥 EXCEPTIONAL DEAL"
-    elif drop >= 55:
-        title = "🚨 VERY STRONG DEAL"
-    else:
-        title = "⚡ STRONG DEAL"
-
-    low_text = (
-        f"₹{low:,.0f}"
-        if low
-        else "Unavailable"
-    )
-
-    return (
-        f"{title}\n\n"
-        f"Store: {store.upper()}\n"
-        f"Current price: ₹{current:,.0f}\n"
-        f"30-day average: ₹{average:,.0f}\n"
-        f"Below 30-day average: {drop:.1f}%\n"
-        f"All-time low: {low_text}\n\n"
-        f"🛒 Buy: {url}\n"
-        f"📊 History: {history_url}"
-    )
-
-
-# =========================
+# --------------------------------------------------
 # MAIN
-# =========================
+# --------------------------------------------------
+
+def check_one(page, state, url, item):
+    try:
+        store = item.get("store") or store_of(url)
+
+        if not store:
+            return
+
+        print("URL:", url)
+
+        current = live_price(
+            page,
+            store,
+            url
+        )
+
+        if not current:
+            print("SKIP → LIVE PRICE NOT CONFIRMED")
+            return
+
+        print("LIVE:", current)
+
+        if current >= MAX_PRICE:
+            print("SKIP → ABOVE ₹8,000")
+            return
+
+        h = history(page, url)
+
+        if not h:
+            print("SKIP → HISTORY NOT FOUND")
+            return
+
+        avg = h["avg"]
+        low = h["low"]
+
+        if avg <= 0:
+            return
+
+        drop = ((avg - current) / avg) * 100
+
+        print(
+            f"AVG: ₹{avg:,.0f} | "
+            f"DROP: {drop:.1f}%"
+        )
+
+        if low:
+            print(f"LOW: ₹{low:,.0f}")
+
+        if drop < MIN_DROP:
+            print("NO DEAL")
+            return
+
+        if drop >= 75:
+            title = "💥 UNPRECEDENTED DEAL"
+        elif drop >= 65:
+            title = "🔥 EXCEPTIONAL DEAL"
+        elif drop >= 55:
+            title = "🚨 VERY STRONG DEAL"
+        else:
+            title = "⚡ STRONG DEAL"
+
+        low_text = (
+            f"₹{low:,.0f}"
+            if low else "Unavailable"
+        )
+
+        msg = (
+            f"{title}\n\n"
+            f"Store: {store.upper()}\n"
+            f"Current: ₹{current:,.0f}\n"
+            f"30-day average: ₹{avg:,.0f}\n"
+            f"Below average: {drop:.1f}%\n"
+            f"All-time low: {low_text}\n\n"
+            f"🛒 {url}\n"
+            f"📊 {h['url']}"
+        )
+
+        if telegram(msg):
+            print("🚨 ALERT SENT")
+
+            if url not in state["sent"]:
+                state["sent"].append(url)
+
+        else:
+            print("TELEGRAM FAILED")
+
+    except Exception as e:
+        print("PRODUCT FAILED:", url)
+        print("ERROR:", repr(e))
+        traceback.print_exc()
+
 
 def main():
     state = load_state()
 
-    print("===================================")
+    print("================================")
     print("VIBHU PRICE SNIPER")
-    print("===================================")
-    print("Queue:", len(state["queue"]))
+    print("================================")
+    print("QUEUE:", len(state["queue"]))
 
-    with sync_playwright() as playwright:
+    try:
+        with sync_playwright() as p:
 
-        browser = playwright.chromium.launch(
-            headless=True
-        )
-
-        context = browser.new_context(
-            viewport={
-                "width": 1365,
-                "height": 900,
-            },
-            locale="en-IN",
-        )
-
-        page = context.new_page()
-
-        # -------------------------
-        # DISCOVERY
-        # -------------------------
-
-        discover(page, state)
-
-        # -------------------------
-        # SELECT PRODUCTS TO CHECK
-        # -------------------------
-
-        now = time.time()
-
-        ready = []
-
-        for url, item in state["queue"].items():
-
-            last_checked = state["checked"].get(
-                url,
-                0
+            browser = p.chromium.launch(
+                headless=True
             )
 
-            if (
-                now - last_checked
-                >= RECHECK_HOURS * 3600
-            ):
-                ready.append((url, item))
-
-        print("READY:", len(ready))
-
-        batch = ready[:BATCH_SIZE]
-
-        print("THIS RUN:", len(batch))
-
-        # -------------------------
-        # CHECK PRODUCTS
-        # -------------------------
-
-        for number, (url, item) in enumerate(
-            batch,
-            start=1
-        ):
-
-            store = item.get("store") or detect_store(url)
-
-            print()
-            print(
-                f"[{number}/{len(batch)}]"
-                f" {store.upper()}"
-            )
-            print(url)
-
-            # ---- LIVE PRICE ----
-
-            current = get_retailer_price(
-                page,
-                store,
-                url,
+            context = browser.new_context(
+                viewport={
+                    "width": 1365,
+                    "height": 900
+                },
+                locale="en-IN"
             )
 
-            if not current:
+            page = context.new_page()
 
-                print(
-                    "SKIP → Could not confidently"
-                    " identify live price"
-                )
+            # Discovery is protected.
+            try:
+                discover(page, state)
+            except Exception as e:
+                print("DISCOVERY CRASH:", repr(e))
+                traceback.print_exc()
 
-                state["checked"][url] = now
-                save_state(state)
-                continue
-
-            print(
-                f"LIVE PRICE → ₹{current:,.0f}"
-            )
-
-            # Price must be strictly below ₹8,000.
-            if current >= MAX_PRICE:
-
-                print(
-                    "SKIP → Price is ₹8,000 or higher"
-                )
-
-                state["checked"][url] = now
-                save_state(state)
-                continue
-
-            # ---- PRICE HISTORY ----
-
-            history = history_lookup(
-                page,
-                url,
-            )
-
-            if not history:
-
-                print(
-                    "SKIP → Exact history unavailable"
-                )
-
-                state["checked"][url] = now
-                save_state(state)
-                continue
-
-            average = history["avg30"]
-            low = history["low"]
-
-            drop = (
-                (average - current)
-                / average
-                * 100
-            )
-
-            print(
-                f"30D AVG → ₹{average:,.0f}"
-            )
-
-            print(
-                f"DROP → {drop:.1f}%"
-            )
-
-            if low:
-                print(
-                    f"ALL-TIME LOW → ₹{low:,.0f}"
-                )
-
-            # Mark checked BEFORE sending.
-            state["checked"][url] = now
             save_state(state)
 
-            # -------------------------
-            # DEAL RULE
-            # -------------------------
+            now = time.time()
+            ready = []
 
-            if drop < MIN_DROP_PERCENT:
+            for url, item in list(
+                state["queue"].items()
+            ):
+                try:
+                    last = float(
+                        state["checked"].get(url, 0)
+                    )
 
-                print("NO DEAL")
+                    if (
+                        now - last
+                        >= RECHECK_HOURS * 3600
+                    ):
+                        ready.append((url, item))
 
-                continue
+                except Exception:
+                    ready.append((url, item))
 
-            # -------------------------
-            # SEND IMMEDIATELY
-            # -------------------------
+            print("READY:", len(ready))
 
-            message = deal_message(
-                store,
-                current,
-                average,
-                low,
-                drop,
-                url,
-                history["history_url"],
+            batch = ready[:BATCH_SIZE]
+
+            print(
+                "PROCESSING:",
+                len(batch)
             )
 
-            if send_telegram(message):
+            for i, (url, item) in enumerate(
+                batch,
+                1
+            ):
 
-                print("🚨 ALERT SENT")
-
-                if url not in state["sent"]:
-                    state["sent"].append(url)
-
-                save_state(state)
-
-            else:
-
+                print()
                 print(
-                    "ALERT FAILED → product remains"
-                    " eligible for future checking"
+                    f"========== {i}/{len(batch)} =========="
                 )
 
-        browser.close()
+                # Mark the attempt BEFORE processing.
+                # This prevents one broken product from
+                # being retried every 15 minutes.
+                state["checked"][url] = now
+                save_state(state)
 
-    save_state(state)
+                check_one(
+                    page,
+                    state,
+                    url,
+                    item
+                )
+
+                # Save after EVERY product.
+                save_state(state)
+
+            browser.close()
+
+    except Exception as e:
+        print()
+        print("================================")
+        print("MAIN ERROR — STATE SAVED")
+        print("================================")
+        print(repr(e))
+        traceback.print_exc()
+
+    finally:
+        save_state(state)
 
     print()
-    print("===================================")
-    print("RUN FINISHED")
+    print("================================")
+    print("SCAN FINISHED")
     print("QUEUE:", len(state["queue"]))
-    print("===================================")
+    print("================================")
 
 
 if __name__ == "__main__":
