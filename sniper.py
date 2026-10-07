@@ -1,201 +1,197 @@
-import os,re,json,time,requests
+import os,re,json,requests
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor,as_completed
-from urllib.parse import urljoin,urlparse
+from urllib.parse import urljoin
 
-MAX_RATIO=.50
+BASE="https://pricehistoryapp.com"
+FEEDS=["/deals/store/flipkart","/deals/store/myntra"]
+DROP=.40
 MAX_ALERTS=10
-WORKERS=10
-TIMEOUT=12
-STATE="state.json"
-BOT=os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT=os.getenv("TELEGRAM_CHAT_ID")
+H={"User-Agent":"Mozilla/5.0"}
 
-SOURCES=[
-"https://pricehistoryapp.com/deals",
-"https://pricehistoryapp.com/latest-deals",
-"https://pricehistoryapp.com/deals/store/flipkart",
-"https://pricehistoryapp.com/deals/store/myntra",
-"https://pricehistoryapp.com/featured-deals",
-"https://pricedropy.com/flipkart-price-history",
-"https://pricedropy.com/myntra-price-history"
-]
+S=requests.Session()
+S.headers.update(H)
 
-HEAD={"User-Agent":"Mozilla/5.0 Chrome/131 Safari/537.36"}
-
-CATS={
-"Clothing":"shirt tshirt jeans trouser pants jacket hoodie dress kurta kurti saree blazer cargo shorts clothing",
-"Footwear":"shoe shoes sneaker sneakers slider sliders sandal sandals boots loafer clog footwear",
-"Electronics":"earbud earbuds headphone headset speaker laptop computer monitor keyboard mouse tablet mobile phone smartphone charger powerbank ssd camera tv television printer router smartwatch watch trimmer gaming electronic"
-}
-
-def get(u,t=TIMEOUT):
+def get(url):
     try:
-        r=requests.get(u,headers=HEAD,timeout=t)
-        return r.text if r.status_code==200 else ""
-    except: return ""
-
-def store(u):
-    h=urlparse(u).netloc.lower()
-    if "flipkart.com" in h:return"Flipkart"
-    if "myntra.com" in h:return"Myntra"
-    return""
+        return S.get(url,timeout=15)
+    except:
+        return None
 
 def money(x):
-    m=re.search(r"(\d[\d,]*(?:\.\d+)?)",str(x or ""))
-    return float(m.group(1).replace(",","")) if m else None
+    try:
+        return float(re.sub(r"[^\d.]","",x.replace(",","")))
+    except:
+        return 0
 
-def ld(s):
-    out=[]
-    for x in s.find_all("script",type="application/ld+json"):
-        try:
-            y=json.loads(x.string or x.get_text())
-            out+=y if isinstance(y,list) else[y]
-        except:pass
-    return out
+def current_price(s):
+    t=s.get_text(" ",strip=True)
 
-def price(s):
-    for x in ld(s):
-        if isinstance(x,dict):
-            o=x.get("offers")
-            if isinstance(o,list):o=o[0] if o else None
-            if isinstance(o,dict) and money(o.get("price")):
-                return money(o["price"])
-            if money(x.get("price")):return money(x["price"])
-    x=s.find(attrs={"itemprop":"price"})
-    return money(x.get("content") or x.get_text()) if x else None
+    patterns=[
+        r"Current\s*(?:Price)?\s*[:\-]?\s*₹\s*([\d,]+)",
+        r"Today\s*[:\-]?\s*₹\s*([\d,]+)"
+    ]
 
-def name(s):
-    for x in ld(s):
-        if isinstance(x,dict) and x.get("name"):
-            return str(x["name"]).strip()
-    x=s.find("meta",property="og:title")
-    return x.get("content","").strip() if x else (
-        s.title.get_text(strip=True) if s.title else "Unknown"
+    for p in patterns:
+        m=re.search(p,t,re.I)
+        if m:
+            return money(m.group(1))
+
+    return 0
+
+def avg30(s):
+    t=s.get_text(" ",strip=True)
+    m=re.search(r"30d\s*Average\s*₹\s*([\d,]+)",t,re.I)
+    return money(m.group(1)) if m else 0
+
+def score(s):
+    t=s.get_text(" ",strip=True)
+    m=re.search(r"Deal\s*Score\s*(\d+)\s*/\s*100",t,re.I)
+    return int(m.group(1)) if m else 0
+
+def buy_url(s,page):
+    for a in s.select("a[href]"):
+        txt=a.get_text(" ",strip=True).lower()
+        href=a.get("href","")
+
+        if ("view deal" in txt or "buy" in txt) and (
+            "flipkart" in txt or "myntra" in txt
+        ):
+            return urljoin(page,href)
+
+    for a in s.select("a[href]"):
+        href=a.get("href","")
+        if "flipkart.com" in href or "myntra.com" in href:
+            return href
+
+    return page
+
+def scan():
+    deals=[]
+    seen=set()
+
+    for feed in FEEDS:
+        r=get(BASE+feed)
+        if not r:
+            continue
+
+        s=BeautifulSoup(r.text,"html.parser")
+
+        for a in s.select("a[href]"):
+            href=urljoin(BASE,a["href"])
+            text=a.get_text(" ",strip=True)
+
+            if href in seen:
+                continue
+
+            if "pricehistoryapp.com" not in href:
+                continue
+
+            if not any(x in text.lower() for x in
+                       ["flipkart","myntra"]):
+                continue
+
+            seen.add(href)
+
+            p=get(href)
+            if not p:
+                continue
+
+            ps=BeautifulSoup(p.text,"html.parser")
+
+            cur=current_price(ps)
+            avg=avg30(ps)
+            sc=score(ps)
+
+            if not cur or not avg:
+                continue
+
+            drop=(avg-cur)/avg
+
+            # EXACT RULE:
+            # current price must be at least 40% below 30-day average
+            if drop < DROP:
+                continue
+
+            buy=buy_url(ps,href)
+
+            deals.append({
+                "title":ps.title.get_text(strip=True)
+                        if ps.title else "Deal",
+                "cur":cur,
+                "avg":avg,
+                "drop":round(drop*100),
+                "score":sc,
+                "url":buy
+            })
+
+    return sorted(
+        deals,
+        key=lambda x:(x["drop"],x["score"]),
+        reverse=True
     )
 
-def avg(s):
-    t=s.get_text(" ",strip=True)
-    for p in[
-        r"(?:30|90|180|365)[-\s]?day\s+average[^₹]*₹\s*([\d,]+)",
-        r"historical\s+average[^₹]*₹\s*([\d,]+)",
-        r"average\s+price[^₹]*₹\s*([\d,]+)",
-        r"average[^₹]*₹\s*([\d,]+)"
-    ]:
-        m=re.search(p,t,re.I)
-        if m:return money(m.group(1))
-    return None
-
-def cat(n):
-    n=n.lower()
-    for c,w in CATS.items():
-        if any(x in n for x in w.split()):
-            return c
-
-def buy(s,u):
-    for a in s.find_all("a",href=True):
-        x=urljoin(u,a["href"])
-        if store(x):
-            return x
-    return ""
-
-def check(u):
-    p=get(u)
-    if not p:return
-    s=BeautifulSoup(p,"html.parser")
-    n=name(s); a=avg(s); tracked=price(s); b=buy(s,u)
-    if not b or not a or not tracked:return
-    st=store(b); c=cat(n)
-    if st not in("Flipkart","Myntra") or not c:return
-
-    rp=get(b)
-    actual=None
-    if rp:
-        actual=price(BeautifulSoup(rp,"html.parser"))
-
-    cur=actual or tracked
-
-    if not cur or cur<=0 or cur/a>MAX_RATIO:return
-
-    return {
-        "name":n,"cat":c,"store":st,
-        "current":cur,"avg":a,
-        "discount":(1-cur/a)*100,
-        "buy":b
-    }
-
-def discover():
-    out=set()
-    for u in SOURCES:
-        p=get(u)
-        if not p:continue
-        s=BeautifulSoup(p,"html.parser")
-        for a in s.find_all("a",href=True):
-            x=urljoin(u,a["href"]).split("#")[0]
-            if any(z in urlparse(x).path.lower()
-                   for z in["/product/","/products/",
-                             "/price-history/","/track/","/tracker/"]):
-                out.add(x)
-    return list(out)
-
 def send(x):
-    try:
-        r=requests.post(
-            f"https://api.telegram.org/bot{BOT}/sendMessage",
-            data={"chat_id":CHAT,"text":x,
-                  "disable_web_page_preview":False},
-            timeout=15)
-        return r.ok
-    except:return False
+    token=os.getenv("TELEGRAM_BOT_TOKEN")
+    chat=os.getenv("TELEGRAM_CHAT_ID")
 
-def load():
-    try:
-        return json.load(open(STATE))
-    except:return {}
+    if not token or not chat:
+        return
 
-def save(x):
-    json.dump(x,open(STATE,"w"),indent=2)
+    msg=f"""🔥 REAL PRICE DROP
+
+{x["title"]}
+
+💰 Current: ₹{x["cur"]:,.0f}
+📊 30-Day Average: ₹{x["avg"]:,.0f}
+📉 Below 30-Day Avg: {x["drop"]}%
+⭐ Deal Score: {x["score"]}/100
+
+🛒 BUY NOW:
+{x["url"]}"""
+
+    requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data={
+            "chat_id":chat,
+            "text":msg,
+            "disable_web_page_preview":False
+        },
+        timeout=10
+    )
 
 def main():
-    urls=discover()
-    print("Discovered:",len(urls))
+    deals=scan()
 
-    deals=[]
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        fs=[ex.submit(check,u) for u in urls]
-        for f in as_completed(fs):
-            try:
-                x=f.result()
-                if x:deals.append(x)
-            except:pass
+    try:
+        with open("state.json") as f:
+            state=json.load(f)
+    except:
+        state={}
 
-    deals.sort(key=lambda x:x["discount"],reverse=True)
+    sent=0
 
-    print("Real deals:",len(deals))
+    print("Qualified deals:",len(deals))
 
-    state=load()
+    for x in deals[:MAX_ALERTS]:
 
-    for d in deals[:MAX_ALERTS]:
-        key=d["store"]+"|"+d["buy"]
-        if key in state:continue
+        key=x["url"]
 
-        msg=(
-            f"🔥 {d['discount']:.0f}% BELOW HISTORY\n\n"
-            f"🛍️ {d['name']}\n"
-            f"📂 {d['cat']}\n"
-            f"🏪 {d['store']}\n\n"
-            f"💰 Now: ₹{d['current']:,.0f}\n"
-            f"📊 Historical avg: ₹{d['avg']:,.0f}\n"
-            f"📉 Drop: {d['discount']:.0f}%\n\n"
-            f"🛒 BUY NOW:\n{d['buy']}"
+        if key in state:
+            continue
+
+        send(x)
+        state[key]=1
+        sent+=1
+
+        print(
+            f"🔥 {x['drop']}% below 30d avg | "
+            f"₹{x['cur']:,.0f} | {x['title']}"
         )
 
-        if send(msg):
-            state[key]={"sent":int(time.time())}
-            print("Sent:",d["name"][:60])
+    with open("state.json","w") as f:
+        json.dump(state,f,indent=2)
 
-    save(state)
-    print("Done")
+    print("Alerts sent:",sent)
 
 if __name__=="__main__":
     main()
