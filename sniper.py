@@ -1,13 +1,15 @@
-import os, re, json, time
+import os
+import re
+import json
+import time
 from datetime import datetime
-from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from playwright.sync_api import sync_playwright
 
 MAX_PRICE = 8000
-MAX_PER_RUN = 100
+BATCH_SIZE = 100
 WORKERS = 4
 STATE_FILE = "state.json"
 
@@ -15,18 +17,29 @@ BOT = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT = os.environ["TELEGRAM_CHAT_ID"]
 
 SEARCHES = [
-    "men shirts", "men t shirts", "men jeans",
-    "women tops", "women dresses", "women jeans",
-    "shoes", "sneakers", "footwear",
-    "earbuds", "headphones", "smartwatch",
-    "electronics", "laptop", "monitor",
-    "bags", "wallets"
+    "men shirts",
+    "men t shirts",
+    "men jeans",
+    "women tops",
+    "women dresses",
+    "women jeans",
+    "shoes",
+    "sneakers",
+    "footwear",
+    "earbuds",
+    "headphones",
+    "smartwatch",
+    "electronics",
+    "laptop",
+    "monitor",
+    "bags",
+    "wallets"
 ]
 
 
 def load_state():
     try:
-        with open(STATE_FILE, "r") as f:
+        with open(STATE_FILE) as f:
             return json.load(f)
     except:
         return {
@@ -37,21 +50,17 @@ def load_state():
 
 
 def save_state(state):
-    tmp = STATE_FILE + ".tmp"
-
-    with open(tmp, "w") as f:
+    with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
-    os.replace(tmp, STATE_FILE)
 
-
-def telegram(text):
+def send_telegram(message):
     try:
         requests.post(
             f"https://api.telegram.org/bot{BOT}/sendMessage",
             data={
                 "chat_id": CHAT,
-                "text": text
+                "text": message
             },
             timeout=15
         )
@@ -60,64 +69,93 @@ def telegram(text):
 
 
 def discover():
-    found = set()
+
+    products = set()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+
+        browser = p.chromium.launch(
+            headless=True
+        )
+
         page = browser.new_page()
 
-        for store in ["flipkart.com", "myntra.com"]:
+        for store in ["flipkart", "myntra"]:
 
-            for query in SEARCHES:
+            for search in SEARCHES:
 
-                print("SEARCH:", store, query)
+                print(f"SEARCH: {store} {search}")
 
                 try:
-                    url = (
-                        "https://www.google.com/search?q="
-                        + quote(f"site:{store} {query}")
-                    )
+
+                    q = search.replace(" ", "+")
+
+                    if store == "flipkart":
+                        url = (
+                            "https://www.flipkart.com/search?"
+                            f"q={q}"
+                        )
+                    else:
+                        url = (
+                            "https://www.myntra.com/"
+                            + search.replace(" ", "-")
+                        )
 
                     page.goto(
                         url,
                         wait_until="domcontentloaded",
-                        timeout=12000
+                        timeout=20000
                     )
 
-                    page.wait_for_timeout(700)
+                    page.wait_for_timeout(1200)
+
+                    # Scroll so lazy-loaded products appear
+                    for _ in range(4):
+                        page.mouse.wheel(0, 1800)
+                        page.wait_for_timeout(400)
 
                     for a in page.locator("a").all():
 
                         href = a.get_attribute("href") or ""
 
-                        if store not in href:
-                            continue
+                        if store == "flipkart":
 
-                        if store == "flipkart.com":
-                            valid = "/p/" in href
+                            if "/p/" not in href:
+                                continue
+
+                            if not href.startswith("http"):
+                                href = "https://www.flipkart.com" + href
+
+                            href = href.split("?")[0]
+
                         else:
-                            valid = "/buy/" in href
 
-                        if valid:
-                            href = href.split("&")[0]
-                            found.add(href)
+                            if "/buy/" not in href:
+                                continue
+
+                            if not href.startswith("http"):
+                                href = "https://www.myntra.com" + href
+
+                            href = href.split("?")[0]
+
+                        products.add(href)
 
                 except Exception as e:
-                    print("Search skipped:", e)
+                    print("Skipped:", str(e))
 
         browser.close()
 
-    return list(found)
+    return list(products)
 
 
-def check_history(url):
+def price_history(url):
+
     try:
 
         with sync_playwright() as p:
 
             browser = p.chromium.launch(
-                headless=True,
-                args=["--disable-dev-shm-usage"]
+                headless=True
             )
 
             page = browser.new_page()
@@ -125,10 +163,10 @@ def check_history(url):
             page.goto(
                 "https://pricehistoryapp.com/",
                 wait_until="domcontentloaded",
-                timeout=15000
+                timeout=20000
             )
 
-            page.wait_for_timeout(800)
+            page.wait_for_timeout(1000)
 
             inputs = page.locator("input").all()
 
@@ -136,15 +174,23 @@ def check_history(url):
 
             for inp in inputs:
 
-                typ = (inp.get_attribute("type") or "").lower()
-                ph = (inp.get_attribute("placeholder") or "").lower()
+                typ = (
+                    inp.get_attribute("type")
+                    or ""
+                ).lower()
+
+                placeholder = (
+                    inp.get_attribute("placeholder")
+                    or ""
+                ).lower()
 
                 if typ in ["text", "search", ""]:
+
                     if (
-                        "url" in ph
-                        or "link" in ph
-                        or "product" in ph
-                        or ph == ""
+                        "url" in placeholder
+                        or "link" in placeholder
+                        or "product" in placeholder
+                        or not placeholder
                     ):
                         box = inp
                         break
@@ -156,7 +202,7 @@ def check_history(url):
             box.fill(url)
             box.press("Enter")
 
-            page.wait_for_timeout(1800)
+            page.wait_for_timeout(2500)
 
             text = page.locator("body").inner_text()
 
@@ -164,7 +210,7 @@ def check_history(url):
             average = None
 
             m = re.search(
-                r"Current:\s*₹\s*([\d,]+)",
+                r"Current\s*:?\s*₹\s*([\d,]+)",
                 text,
                 re.I
             )
@@ -175,7 +221,7 @@ def check_history(url):
                 )
 
             m = re.search(
-                r"30d\s*Average\s*₹?\s*([\d,]+)",
+                r"30d\s*Average\s*:?\s*₹\s*([\d,]+)",
                 text,
                 re.I
             )
@@ -193,7 +239,9 @@ def check_history(url):
             return current, average
 
     except Exception as e:
+
         print("History error:", str(e))
+
         return None
 
 
@@ -201,22 +249,22 @@ def main():
 
     state = load_state()
 
-    # -----------------------------
+    # --------------------------------
     # DISCOVERY
-    # -----------------------------
+    # --------------------------------
 
-    print("Starting discovery...")
+    print("Starting catalogue discovery...")
 
-    discovered = discover()
+    found = discover()
 
-    print("Discovered:", len(discovered))
+    print("Discovered:", len(found))
 
     known = set(state["queue"])
     known.update(state["checked"].keys())
 
     added = 0
 
-    for url in discovered:
+    for url in found:
 
         if url not in known:
 
@@ -229,28 +277,26 @@ def main():
 
     save_state(state)
 
-    # -----------------------------
-    # TAKE BATCH
-    # -----------------------------
+    # --------------------------------
+    # BATCH
+    # --------------------------------
 
-    batch = state["queue"][:MAX_PER_RUN]
+    batch = state["queue"][:BATCH_SIZE]
 
     if not batch:
 
-        print("Nothing to check.")
+        print("No products waiting.")
         return
 
-    print("Checking:", len(batch))
+    print("History checking:", len(batch))
 
-    # Remove batch immediately.
-    # Results are saved individually below.
     state["queue"] = state["queue"][len(batch):]
 
     save_state(state)
 
-    # -----------------------------
-    # PARALLEL HISTORY CHECK
-    # -----------------------------
+    # --------------------------------
+    # PARALLEL CHECK
+    # --------------------------------
 
     results = {}
 
@@ -259,41 +305,40 @@ def main():
     ) as executor:
 
         jobs = {
-            executor.submit(check_history, url): url
+            executor.submit(price_history, url): url
             for url in batch
         }
 
-        for n, future in enumerate(
+        for number, job in enumerate(
             as_completed(jobs), 1
         ):
 
-            url = jobs[future]
+            url = jobs[job]
 
             try:
-                result = future.result()
+                result = job.result()
             except:
                 result = None
 
             results[url] = result
 
             print(
-                f"[{n}/{len(batch)}]",
-                result,
-                url
+                f"[{number}/{len(batch)}]",
+                result
             )
 
-    # -----------------------------
-    # PROCESS RESULTS
-    # -----------------------------
+    # --------------------------------
+    # DEAL FILTER
+    # --------------------------------
 
-    checked_time = datetime.utcnow().isoformat()
+    qualified = 0
 
     for url in batch:
 
         result = results.get(url)
 
         state["checked"][url] = {
-            "time": checked_time,
+            "time": datetime.utcnow().isoformat(),
             "result": result
         }
 
@@ -308,18 +353,19 @@ def main():
         if average <= 0:
             continue
 
-        ratio = current / average
-
         # Must be at least 45% below average
-        if ratio > 0.55:
+        if current > average * 0.55:
             continue
 
-        drop = (1 - ratio) * 100
+        qualified += 1
+
+        drop = (
+            1 - current / average
+        ) * 100
 
         signature = (
-            str(round(current)) +
-            ":" +
-            str(round(average))
+            f"{round(current)}:"
+            f"{round(average)}"
         )
 
         if state["alerts"].get(url) == signature:
@@ -329,29 +375,25 @@ def main():
             "🚨 BLOCKBUSTER DEAL\n\n"
             f"Current: ₹{current:,.0f}\n"
             f"30-day average: ₹{average:,.0f}\n"
-            f"Below 30d average: {drop:.1f}%\n\n"
+            f"Below average: {drop:.1f}%\n\n"
             f"{url}"
         )
 
-        telegram(message)
+        send_telegram(message)
 
         state["alerts"][url] = signature
 
-        print("🔥 ALERT SENT:", url)
+        print("🔥 ALERT:", url)
 
     save_state(state)
 
     print()
-    print("========== DONE ==========")
+    print("============================")
+    print("RUN COMPLETE")
     print("Checked:", len(batch))
-    print("Qualified:", sum(
-        1 for x in results.values()
-        if x and x[0] < MAX_PRICE
-        and x[1] > 0
-        and x[0] / x[1] <= 0.55
-    ))
-    print("Remaining queue:", len(state["queue"]))
-    print("===========================")
+    print("Qualified:", qualified)
+    print("Queue remaining:", len(state["queue"]))
+    print("============================")
 
 
 if __name__ == "__main__":
