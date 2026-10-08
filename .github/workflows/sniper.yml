@@ -2,11 +2,18 @@ name: Vibhu Price Sniper
 
 on:
   workflow_dispatch:
+
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: write
+
+# Prevent multiple scanner runs from running at the same time.
+# If one scan is still running, the next scheduled run waits.
+concurrency:
+  group: vibhu-price-sniper
+  cancel-in-progress: false
 
 jobs:
   scanner:
@@ -43,6 +50,9 @@ jobs:
         run: |
           git config user.name "vibhu-price-sniper"
           git config user.email "actions@users.noreply.github.com"
+
           git add state.json
+
           git diff --cached --quiet || git commit -m "Update scanner state"
+
           git push || true
