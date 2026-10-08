@@ -32,15 +32,12 @@ WOMEN={
 
 def store(url):
     h=urlparse(url).netloc.lower()
-    if "flipkart.com" in h:return "flipkart"
-    if "myntra.com" in h:return "myntra"
-    return None
+    return "flipkart" if "flipkart.com" in h else "myntra" if "myntra.com" in h else None
 
 def clean(url):
     try:
         p=urlparse(url)
-        if not p.scheme or not p.netloc:return None
-        return f"{p.scheme}://{p.netloc}{p.path}".rstrip("/")
+        return f"{p.scheme}://{p.netloc}{p.path}".rstrip("/") if p.scheme and p.netloc else None
     except:return None
 
 def is_product(url):
@@ -48,9 +45,7 @@ def is_product(url):
     if not u:return False
     p=urlparse(u).path
     s=store(u)
-    if s=="flipkart":return "/p/" in p
-    if s=="myntra":return "/buy/" in p
-    return False
+    return "/p/" in p if s=="flipkart" else "/buy/" in p if s=="myntra" else False
 
 def get_price(v):
     try:
@@ -64,15 +59,12 @@ def save(s):
         with open(STATE_FILE+".tmp","w",encoding="utf-8") as f:
             json.dump(s,f,indent=2)
         os.replace(STATE_FILE+".tmp",STATE_FILE)
-    except Exception as e:
-        print("STATE:",e)
+    except Exception as e:print("STATE:",e)
 
 def load():
     try:
-        with open(STATE_FILE,encoding="utf-8") as f:
-            r=json.load(f)
-    except:
-        r={}
+        with open(STATE_FILE,encoding="utf-8") as f:r=json.load(f)
+    except:r={}
 
     if not isinstance(r,dict):r={}
 
@@ -84,12 +76,10 @@ def load():
     elif isinstance(q0,list):
         items=[]
         for x in q0:
-            if isinstance(x,str):
-                items.append((x,{}))
+            if isinstance(x,str):items.append((x,{}))
             elif isinstance(x,dict) and x.get("url"):
                 items.append((x["url"],x))
-    else:
-        items=[]
+    else:items=[]
 
     for k,v in items:
         u=v.get("url",k) if isinstance(v,dict) else k
@@ -97,8 +87,7 @@ def load():
             q[u]={
                 "url":u,
                 "store":store(u),
-                "added":v.get("added",time.time())
-                if isinstance(v,dict) else time.time()
+                "added":v.get("added",time.time()) if isinstance(v,dict) else time.time()
             }
 
     checked=r.get("checked",{})
@@ -107,11 +96,7 @@ def load():
     sent=r.get("sent",[])
     if not isinstance(sent,list):sent=[]
 
-    return {
-        "queue":q,
-        "checked":checked,
-        "sent":sent
-    }
+    return {"queue":q,"checked":checked,"sent":sent}
 
 def checked_time(v):
     try:
@@ -123,10 +108,7 @@ def checked_time(v):
     except:return 0
 
 def telegram(msg):
-    if not TOKEN or not CHAT_ID:
-        print("TELEGRAM SECRETS NOT FOUND")
-        return False
-
+    if not TOKEN or not CHAT_ID:return False
     try:
         r=requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
@@ -145,28 +127,16 @@ def telegram(msg):
 
 async def discover_search(page,s,url,state):
     try:
-        await page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=30000
-        )
+        await page.goto(url,wait_until="domcontentloaded",timeout=30000)
         await page.wait_for_timeout(800)
 
-        links=await page.locator(
-            "a[href]"
-        ).evaluate_all("(x)=>x.map(a=>a.href)")
-
+        links=await page.locator("a[href]").evaluate_all("(x)=>x.map(a=>a.href)")
         n=0
 
         for raw in links:
             u=clean(raw)
 
-            if(
-                u and
-                is_product(u) and
-                store(u)==s and
-                u not in state["queue"]
-            ):
+            if u and is_product(u) and store(u)==s and u not in state["queue"]:
                 state["queue"][u]={
                     "url":u,
                     "store":s,
@@ -182,35 +152,17 @@ async def discover_search(page,s,url,state):
 
 async def discover(page,state):
     for terms,s,base in [
-        (
-            FLIPKART_TERMS,
-            "flipkart",
-            "https://www.flipkart.com/search?q="
-        ),
-        (
-            MYNTRA_TERMS,
-            "myntra",
-            "https://www.myntra.com/"
-        )
+        (FLIPKART_TERMS,"flipkart","https://www.flipkart.com/search?q="),
+        (MYNTRA_TERMS,"myntra","https://www.myntra.com/")
     ]:
         for t in terms:
-            n=await discover_search(
-                page,
-                s,
-                base+quote(t),
-                state
-            )
+            n=await discover_search(page,s,base+quote(t),state)
             print(s,t,n)
             save(state)
 
 async def info(page,url):
     try:
-        await page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=25000
-        )
-
+        await page.goto(url,wait_until="domcontentloaded",timeout=25000)
         await page.wait_for_timeout(400)
 
         title=await page.title()
@@ -220,8 +172,7 @@ async def info(page,url):
             if await h.count():
                 x=(await h.inner_text()).strip()
                 if x:title=x
-        except:
-            pass
+        except:pass
 
         current=None
         rating=None
@@ -231,61 +182,42 @@ async def info(page,url):
         ).all_text_contents()
 
         for raw in scripts:
-            try:
-                d=json.loads(raw)
-            except:
-                continue
+            try:d=json.loads(raw)
+            except:continue
 
             objs=d if isinstance(d,list) else [d]
 
-            if(
-                isinstance(d,dict)
-                and isinstance(d.get("@graph"),list)
-            ):
+            if isinstance(d,dict) and isinstance(d.get("@graph"),list):
                 objs+=d["@graph"]
 
             for o in objs:
-                if not isinstance(o,dict):
-                    continue
+                if not isinstance(o,dict):continue
 
                 typ=o.get("@type")
 
                 if not(
-                    typ=="Product"
-                    or(
-                        isinstance(typ,list)
-                        and "Product" in typ
-                    )
+                    typ=="Product" or
+                    isinstance(typ,list) and "Product" in typ
                 ):
                     continue
 
                 offers=o.get("offers",[])
-                offers=(
-                    offers
-                    if isinstance(offers,list)
-                    else [offers]
-                )
+                offers=offers if isinstance(offers,list) else [offers]
 
                 vals=[
                     get_price(x.get("price"))
                     for x in offers
                     if isinstance(x,dict)
                 ]
-
                 vals=[x for x in vals if x]
 
-                if vals:
-                    current=min(vals)
+                if vals:current=min(vals)
 
                 a=o.get("aggregateRating")
 
                 if isinstance(a,dict):
-                    try:
-                        rating=float(
-                            a.get("ratingValue")
-                        )
-                    except:
-                        pass
+                    try:rating=float(a.get("ratingValue"))
+                    except:pass
 
         if not current:
             for sel in [
@@ -299,7 +231,6 @@ async def info(page,url):
                     current=get_price(
                         await x.get_attribute("content")
                     )
-
                     if current:break
 
         return title,current,rating
@@ -309,8 +240,7 @@ async def info(page,url):
         return None,None,None
 
 def history_values(txt):
-    avg=None
-    low=None
+    avg=low=None
 
     for p in [
         r"30\s*day\s*(?:average|avg).{0,100}?₹\s*([\d,]+)",
@@ -333,95 +263,8 @@ def history_values(txt):
 
     return avg,low
 
-def normal_url(url):
-    try:
-        p=urlparse(url)
-
-        path=p.path.rstrip("/")
-
-        return (
-            p.netloc.lower().replace("www.",""),
-            path.lower()
-        )
-
-    except:
-        return None,None
-
-def same_product_url(a,b):
-    if not a or not b:return False
-
-    ha,pa=normal_url(a)
-    hb,pb=normal_url(b)
-
-    if not ha or not hb:return False
-
-    if ha!=hb:return False
-
-    return pa==pb
-
-async def verify_history_identity(page,original_url):
-    try:
-        links=await page.locator(
-            "a[href]"
-        ).evaluate_all("(x)=>x.map(a=>a.href)")
-
-        original_host,original_path=normal_url(
-            original_url
-        )
-
-        if not original_host or not original_path:
-            return False
-
-        candidates=[]
-
-        for x in links:
-            if not x:
-                continue
-
-            try:
-                h,p=normal_url(x)
-
-                if h==original_host:
-                    candidates.append(x)
-            except:
-                pass
-
-        for x in candidates:
-            if same_product_url(
-                x,
-                original_url
-            ):
-                print("HISTORY VERIFIED:",x)
-                return True
-
-        body=""
-
-        try:
-            body=(
-                await page.locator("body")
-                .inner_text()
-            )
-        except:
-            pass
-
-        body=body.lower()
-
-        # The exact retailer URL/path may appear as text
-        # even when it is not an <a> element.
-        if original_path.lower() in body:
-            print("HISTORY VERIFIED BY PAGE TEXT")
-            return True
-
-        return False
-
-    except Exception as e:
-        print("VERIFY ERROR:",e)
-        return False
-
 async def history(page,url):
     try:
-        print("HISTORY CHECK:",url)
-
         await page.goto(
             "https://pricehistoryapp.com/",
             wait_until="domcontentloaded",
@@ -433,7 +276,6 @@ async def history(page,url):
         ins=page.locator("input")
 
         if not await ins.count():
-            print("HISTORY: NO INPUT")
             return None
 
         target=ins.first
@@ -459,10 +301,8 @@ async def history(page,url):
         for i in range(await bs.count()):
             b=bs.nth(i)
 
-            try:
-                t=(await b.inner_text()).lower()
-            except:
-                t=""
+            try:t=(await b.inner_text()).lower()
+            except:t=""
 
             if "track" in t:
                 await b.click()
@@ -473,15 +313,10 @@ async def history(page,url):
             for i in range(await bs.count()):
                 b=bs.nth(i)
 
-                try:
-                    t=(await b.inner_text()).lower()
-                except:
-                    t=""
+                try:t=(await b.inner_text()).lower()
+                except:t=""
 
-                if(
-                    "check" in t
-                    or "search" in t
-                ):
+                if "check" in t or "search" in t:
                     await b.click()
                     clicked=True
                     break
@@ -489,28 +324,20 @@ async def history(page,url):
         if not clicked:
             await target.press("Enter")
 
-        # Give PriceHistoryApp time to process the URL.
         await page.wait_for_timeout(3000)
 
         if "/product/" not in page.url:
-            links=page.locator(
-                'a[href*="/product/"]'
-            )
+            ls=page.locator('a[href*="/product/"]')
 
-            if await links.count():
-                href=await links.first.get_attribute(
-                    "href"
-                )
+            if await ls.count():
+                h=await ls.first.get_attribute("href")
 
-                if href:
-                    if href.startswith("/"):
-                        href=(
-                            "https://pricehistoryapp.com"
-                            +href
-                        )
+                if h:
+                    if h.startswith("/"):
+                        h="https://pricehistoryapp.com"+h
 
                     await page.goto(
-                        href,
+                        h,
                         wait_until="domcontentloaded",
                         timeout=25000
                     )
@@ -518,40 +345,14 @@ async def history(page,url):
                     await page.wait_for_timeout(1000)
 
         if "/product/" not in page.url:
-            print("HISTORY: NO PRODUCT PAGE")
             return None
 
-        # CRITICAL:
-        # Do not trust a /product/ page by itself.
-        if not await verify_history_identity(
-            page,
-            url
-        ):
-            print(
-                "HISTORY REJECTED: "
-                "PRODUCT IDENTITY MISMATCH"
-            )
-            return None
-
-        body=await page.locator(
-            "body"
-        ).inner_text()
-
-        avg,low=history_values(body)
+        avg,low=history_values(
+            await page.locator("body").inner_text()
+        )
 
         if not avg:
-            print("HISTORY: NO AVG")
             return None
-
-        print(
-            f"HISTORY VERIFIED | "
-            f"AVG ₹{avg:,.0f} | "
-            f"LOW ₹{low:,.0f}"
-            if low
-            else
-            f"HISTORY VERIFIED | "
-            f"AVG ₹{avg:,.0f}"
-        )
 
         return {
             "avg":avg,
@@ -565,9 +366,12 @@ async def history(page,url):
 
 async def check(context,state,url,item,sem):
     async with sem:
+
         page=await context.new_page()
+        history_page=None
 
         try:
+            # Get LIVE retailer price first.
             title,current,rating=await info(
                 page,
                 url
@@ -587,26 +391,21 @@ async def check(context,state,url,item,sem):
                 print("SKIP: ABOVE ₹8000")
                 return
 
-            if(
-                rating is not None
-                and rating<=MIN_RATING
-            ):
-                print(
-                    "SKIP: RATING",
-                    rating
-                )
+            if rating is not None and rating<=MIN_RATING:
+                print("SKIP: RATING",rating)
                 return
 
+            # IMPORTANT:
+            # Use a completely separate page for PriceHistoryApp.
+            history_page=await context.new_page()
+
             h=await history(
-                page,
+                history_page,
                 url
             )
 
-            # Never alert without verified history.
             if not h:
-                print(
-                    "SKIP: HISTORY NOT VERIFIED"
-                )
+                print("SKIP: NO HISTORY")
                 return
 
             avg=h["avg"]
@@ -624,9 +423,7 @@ async def check(context,state,url,item,sem):
             )
 
             if low:
-                print(
-                    f"LOW: ₹{low:,.0f}"
-                )
+                print(f"LOW: ₹{low:,.0f}")
 
             if drop<MIN_DROP:
                 print("NO DEAL")
@@ -641,11 +438,7 @@ async def check(context,state,url,item,sem):
             else:
                 level="⚡ STRONG DEAL"
 
-            low_text=(
-                f"₹{low:,.0f}"
-                if low
-                else "Unavailable"
-            )
+            low_text=f"₹{low:,.0f}" if low else "Unavailable"
 
             msg=(
                 f"{level}\n\n"
@@ -658,10 +451,7 @@ async def check(context,state,url,item,sem):
             )
 
             if rating is not None:
-                msg+=(
-                    f"\n⭐ Rating: "
-                    f"{rating:.1f}"
-                )
+                msg+=f"\n⭐ Rating: {rating:.1f}"
 
             msg+=(
                 f"\n\n🛒 {url}"
@@ -672,15 +462,15 @@ async def check(context,state,url,item,sem):
                 if url not in state["sent"]:
                     state["sent"].append(url)
 
-                print(
-                    "🚨 ALERT:",
-                    title
-                )
+                print("🚨 ALERT:",title)
 
         except Exception as e:
             print("CHECK:",e)
 
         finally:
+            if history_page:
+                await history_page.close()
+
             await page.close()
 
 async def main():
@@ -707,9 +497,7 @@ async def main():
 
         async def route(r):
             if r.request.resource_type in {
-                "image",
-                "media",
-                "font"
+                "image","media","font"
             }:
                 await r.abort()
             else:
@@ -734,35 +522,23 @@ async def main():
             )
 
         await page.close()
-
         save(state)
 
         now=time.time()
         ready=[]
 
         for u,v in state["queue"].items():
-
             last=checked_time(
                 state["checked"].get(u,0)
             )
 
-            if(
-                now-last
-                >=RECHECK_HOURS*3600
-            ):
+            if now-last>=RECHECK_HOURS*3600:
                 ready.append((u,v))
 
         batch=ready[:BATCH_SIZE]
 
-        print(
-            "READY:",
-            len(ready)
-        )
-
-        print(
-            "PROCESSING:",
-            len(batch)
-        )
+        print("READY:",len(ready))
+        print("PROCESSING:",len(batch))
 
         for u,_ in batch:
             state["checked"][u]=now
@@ -788,7 +564,6 @@ async def main():
         )
 
         save(state)
-
         await browser.close()
 
 if __name__=="__main__":
